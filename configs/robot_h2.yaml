@@ -1,0 +1,43 @@
+robot: unitree_h2
+ssh_host: unitree@192.168.1.3
+arm: right
+hand: dex1_1
+right_ee_link:
+  parent_frame: right_wrist_yaw_link
+  translation_m: [0.205, 0.0, 0.0]
+  rotation_rpy_deg: [0.0, 0.0, 0.0]
+  direct_target_rpy_deg: [-88.8133, -3.98969, 3.20691]
+control_gripper: false
+gripper_hold: closed
+control_upper_body: false
+use_ros: false
+hand_eye_calibration: true
+chest_camera:
+  parent_frame: torso_link
+  eye_to_hand_json: /home/unitree/MscapeTech/Hand_Eye_Calib/artifacts/eye_to_hand/outputs/eye_to_hand_20261012_104628.json
+  # Field check: button X is about 3 cm farther than raw cam2reference output.
+  torso_x_bias_m: 0.03
+  # Torso Y is left. Negative moves the target to the robot's right.
+  torso_y_bias_m: 0.0
+  # Field check: target height is about 2.5 cm above raw cam2reference output.
+  torso_z_bias_m: 0.025
+  # cam2reference translation from eye_to_hand_20261012_104628.json.
+  translation_m: [0.1206383192339682, 0.03735776701134677, 0.3895891873499161]
+  translation_tolerance_m: 0.02
+pbvs:
+  coarse_standoff_m: 0.0
+  coarse_xy_tolerance_m: 0.01
+  coarse_z_tolerance_m: 0.01
+  # One IK move onto the button, seeded from the raise pose.
+  # Wrist stays frozen. Shoulder pitch may lift from a hang, up to 120°.
+  direct_speed_m_s: 0.10
+  direct_min_seconds: 1.2
+  direct_max_seconds: 3.5
+  direct_max_joint_deg: 120.0
+
+notes:
+  - Dex1 不接电，永久完全闭合。第一阶段不控夹爪、不张开。
+  - 胸口 D435 使用 eye_to_hand_20261012_104628.json 的 cam2reference；Start 可先 PBVS 再双视 IBVS。
+  - D435I 在左手，侧视右爪与面板的间隙/接触。接触前才允许胸视光轴前进。
+  - 右腕 Park 手眼废弃。Raise：双臂平举且肘约 65°，左臂侧视，右臂举到点触位。
+  - PBVS 一次解到按钮坐标，姿态用运控 right_ee 的 RPY；最终进近与接触仍由右腕图像 IBVS 完成。

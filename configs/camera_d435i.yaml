@@ -1,0 +1,27 @@
+camera:
+  model: d435i
+  role: chest
+  color_size: [640, 480]
+  depth_size: [640, 480]
+  fps: 30
+  align_depth_to_color: true
+  serial_number: "347622074029"
+  known_serials:
+    chest: "347622074029"
+    d435i: "233722073797"
+  views:
+    - name: chest
+      label: D435 胸口
+      model: D435
+      serial_number: "347622074029"
+    - name: d435i
+      label: D435I 右腕 Eye-in-Hand
+      model: D435I
+      serial_number: "233722073797"
+  fallback_intrinsics:
+    fx: 615.0
+    fy: 615.0
+    cx: 320.0
+    cy: 240.0
+    width: 640
+    height: 480

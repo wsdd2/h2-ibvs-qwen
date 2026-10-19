@@ -1,0 +1,35 @@
+# 胸口 Eye-to-Hand PBVS 粗定位。末端用右腕图像 IBVS：按钮像素对准夹爪尖，深度对准指尖。
+# 右腕视觉确认接触后停止。
+
+control_hz: 20
+lambda_xyz: 0.35
+max_delta_m: 0.006
+# 胸口面板深度和侧视到夹爪的距离会替换这个值。深度丢了或超出范围时退回这里。
+image_servo_nominal_depth_m: 0.60
+min_depth_m: 0.08
+max_depth_m: 1.20
+
+# 指尖与按钮重合的门限。左右/上下先进这个门，才允许走深度。
+align_xy_tol_norm: 0.006
+contact_z_tol_m: 0.008
+pixel_tol: 8
+stable_frames: 5
+side_contact_px: 14
+# 胸视左右上下还没对准时，侧视间隙小于这个值就先后退，不要顶在墙上。
+side_standoff_px: 36
+side_approach_step_m: 0.004
+
+# 右腕末端 IBVS。特征是按钮相对夹爪尖的归一化像素，加上两者深度差。
+# 每轮相机位移最多 4 mm。像素差进 8 px 且深度差进 4 mm 后等待视觉接触。
+wrist_target_max_age_s: 0.50
+wrist_approach_max_step_m: 0.004
+wrist_ibvs_lambda_xy: 0.8
+wrist_ibvs_lambda_z: 0.6
+wrist_ibvs_dt_s: 0.25
+wrist_ibvs_pixel_tol: 8.0
+wrist_ibvs_depth_tol_m: 0.004
+wrist_ibvs_pixel_jump: 80
+wrist_ibvs_filter_alpha: 0.55
+
+# 面板是规则矩形时按钮用比例尺。否则姿态点需不低于该置信度且落在面板内。
+yolo_point_conf: 0.3
