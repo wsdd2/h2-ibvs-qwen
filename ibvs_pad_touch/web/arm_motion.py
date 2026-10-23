@@ -11,6 +11,7 @@ from typing import Any, Callable, Optional, Sequence
 
 from ibvs_pad_touch.config import load_ibvs_config
 from ibvs_pad_touch.servo.interaction import eye_in_hand_close_align_step, eye_in_hand_ibvs_step
+from ibvs_pad_touch.web.screen_read import blocks_differ, format_block, read_panel
 
 
 HANDEYE_ROOTS = (
@@ -242,6 +243,8 @@ SEQUENCE_BUTTON_LABELS = {
     "button_2": "Button2",
     "button_3": "Button3",
 }
+# One press plus two repeats. A screen that never changes stops the step.
+SCREEN_PRESS_ATTEMPTS = 3
 
 
 def close_range_forward_x(
@@ -1021,6 +1024,7 @@ class ArmMover:
         pbvs_step_m: float = PBVS_MAX_STEP_M,
         pbvs_step_seconds: float = PBVS_STEP_SECONDS,
         pbvs_max_joint_deg: float = 20.0,
+        motion_backend: str = "arm_sdk",
     ) -> None:
         self.iface = iface
         self.telemetry = telemetry
@@ -1032,6 +1036,14 @@ class ArmMover:
         self.wrist_view = None
         self.cam2hand_matrix = None
         self.on_screen_capture = None
+        self.read_screen = None
+        self.screen_settle_s = 0.6
+        self._screen_progress = False
+        self._screen_report = ""
+        self._screen_history: list[str] = []
+        self._screen_block: dict[str, Any] | None = None
+        self._screen_before = None
+        self._screen_before_info: dict[str, Any] | None = None
         self.wrist_dwell_s = EYE_IN_HAND_DWELL_S
         self.direct_pbvs_poke = bool(direct_pbvs_poke)
         self.direct_pbvs_max_m = max(0.02, float(direct_pbvs_max_m))
@@ -1056,6 +1068,7 @@ class ArmMover:
         self._service_node_probe = None
         self._stop_service_node = None
         self._start_service_node = None
+        self._start_arm_sdk = None
         self._drop_arm_sdk = None
         self._service_node_cached: tuple[float, bool] | None = None
         self._thread: Optional[threading.Thread] = None
@@ -1122,7 +1135,7 @@ class ArmMover:
         self._sequence_resume = False
         self._sequence_resume_index = 0
         self._sequence_finish_only = False
-        self._motion_backend = "arm_sdk"
+        self._motion_backend = self._normalize_backend(motion_backend, default="arm_sdk")
         self._left_seek_origin: list[float] | None = None
         self._left_seek_joint = 0
         self._left_seek_dir = 1
@@ -1177,10 +1190,19 @@ class ArmMover:
             "playback_speed": self._playback_speed,
             "button_sequence": list(self._button_sequence),
             "sequence_mode": self._sequence_mode,
+            "screen_progress": self._screen_progress,
+            "screen_report": self._screen_report,
+            "screen_history": list(self._screen_history),
+            "screen_block": None if self._screen_block is None else dict(self._screen_block),
             "sequence_run": self._sequence_run,
             "sequence_stage": self._sequence_stage,
             "locked_buttons": {name: list(value) for name, value in self._locked_buttons.items()},
             "pbvs_source": self._pbvs_source,
+            "wrist_command_step_m": (
+                None
+                if self._wrist_ibvs_step is None
+                else [float(value) for value in self._wrist_ibvs_step]
+            ),
         }
 
     def servo_mode(self) -> str:
@@ -1326,6 +1348,41 @@ class ArmMover:
             self.log(f"[ARM] 启动运控服务失败: {exc}")
             return False
 
+    def _call_start_arm_sdk(self) -> bool:
+        """Enable this page's arm_sdk publisher. A test hook replaces the real connect."""
+        fn = self._start_arm_sdk
+        if fn is not None:
+            try:
+                ok = bool(fn())
+            except Exception as exc:
+                self.message = f"arm_sdk 没有起来: {exc}"
+                return False
+            if not ok:
+                self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
+            return ok
+        if self._sdk_holding():
+            return True
+        try:
+            self._connect()
+        except Exception as exc:
+            self._drop_failed_sdk()
+            self.message = f"arm_sdk 没有起来: {exc}"
+            self.log(f"[ARM] {self.message}")
+            return False
+        if self.controller is None:
+            self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
+            return False
+        return True
+
+    @staticmethod
+    def _normalize_backend(backend: str, default: str = "") -> str:
+        chosen = str(backend or "").strip().lower().replace("-", "_")
+        if chosen in {"sdk", "arm"}:
+            chosen = "arm_sdk"
+        if chosen in {"", "arm_sdk", "service"}:
+            return chosen
+        return default
+
     def publisher_conflict(self, publisher: str) -> str:
         """Refuse when this page and h2_arm_service_node would both publish rt/arm_sdk."""
         which = "service" if str(publisher) == "service" else "arm_sdk"
@@ -1342,7 +1399,11 @@ class ArmMover:
         return ""
 
     def _refuse_conflict(self, publisher: str | None = None) -> str:
-        which = publisher or ("service" if self._motion_backend == "service" else "arm_sdk")
+        if self._motion_backend not in {"arm_sdk", "service"}:
+            self.message = "请先点 arm_sdk 或 Service，再操作手臂。"
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        which = publisher or self._motion_backend
         message = self.publisher_conflict(which)
         if message:
             self.message = message
@@ -1373,7 +1434,7 @@ class ArmMover:
         if (
             chosen == self._motion_backend == "arm_sdk"
             and not node_up
-            and not self._sdk_holding()
+            and self._sdk_holding()
         ):
             self.message = "控制链路已是 arm_sdk"
             return self.message
@@ -1387,6 +1448,7 @@ class ArmMover:
         self._drop_page_holder(quiet=node_up and self._sdk_holding())
         self._service_node_cached = None
         if chosen == "arm_sdk":
+            stopped_service = False
             if self._service_node_up():
                 stopped = self._call_stop_service_node()
                 self._service_node_cached = None
@@ -1398,17 +1460,27 @@ class ArmMover:
                     )
                     self.log(f"[ARM][WARN] {self.message}")
                     return self.message
+                stopped_service = True
             self._motion_backend = "arm_sdk"
-            self.message = "已停止运控服务。控制链路：arm_sdk。下次 Raise/Start 由本页发布 arm_sdk。"
+            if not self._call_start_arm_sdk():
+                self._motion_backend = ""
+                if not self.message:
+                    self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
+                self.log(f"[ARM][WARN] {self.message}")
+                return self.message
+            if stopped_service:
+                self.message = "已停止运控服务，并拉起 arm_sdk。控制链路：arm_sdk。"
+            else:
+                self.message = "已拉起 arm_sdk。控制链路：arm_sdk。"
         else:
             if not self._service_node_up():
                 self._call_start_service_node()
                 self._service_node_cached = None
             self._motion_backend = "service"
             if self._service_node_up():
-                self.message = "控制链路：运控服务。下次 Raise/Start 调用 h2_arm_service，本页不发 arm_sdk。"
+                self.message = "已拉起 h2_arm_service_node。控制链路：运控服务。本页不发 arm_sdk。"
             else:
-                self.message = "控制链路：运控服务。h2_arm_service_node 没有起来，Start 前请确认节点。"
+                self.message = "控制链路：运控服务。h2_arm_service_node 没有起来，请再点一次 Service。"
         self.log(f"[ARM] {self.message}")
         return self.message
 
@@ -1504,6 +1576,17 @@ class ArmMover:
         """Refuse. Right-forearm leveling hits the chest camera."""
         self._level_right.clear()
         self.message = "右臂平举已关闭：该姿态会撞胸口相机，手臂保持不动"
+        self.log(f"[ARM] {self.message}")
+        return self.message
+
+    def set_screen_progress(self, enabled: bool) -> str:
+        """Watch the panel after each press. Off leaves the arm path unchanged."""
+        if self._ibvs_enabled or self._running.is_set() or self._sequence_run:
+            self.message = "先 Pause 或等这一轮结束，再切换读取屏幕"
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        self._screen_progress = bool(enabled)
+        self.message = "读取屏幕判断进度：开" if self._screen_progress else "读取屏幕判断进度：关"
         self.log(f"[ARM] {self.message}")
         return self.message
 
@@ -2569,12 +2652,18 @@ class ArmMover:
             ):
                 self._run_button_sequence()
                 return
+            if self._screen_progress and not self._return_ready.is_set() and not self._stop.is_set():
+                self._run_single_press_with_screen(telem, direct=True)
+                return
             self._fuse_wrist_pbvs(telem)
             telem = self.telemetry() or telem
         if self._control_stage == "DIRECT_PBVS":
             self._direct_pbvs_once(telem)
             return
         if self._control_stage == "PBVS_COARSE":
+            if self._screen_progress and not self._sequence_run and not self._return_ready.is_set() and not self._stop.is_set():
+                self._run_single_press_with_screen(telem, direct=False)
+                return
             self._pbvs_once(telem)
             return
         if self._control_stage == "WRIST_APPROACH":
@@ -4841,6 +4930,173 @@ class ArmMover:
             return False
         return self.phase == "direct_pbvs_complete"
 
+    def _reset_screen_watch(self) -> None:
+        self._screen_before = None
+        self._screen_before_info = None
+        self._screen_block = None
+        self._screen_report = ""
+        self._screen_history = []
+
+    def _push_screen_line(self, line: str) -> None:
+        self._screen_report = line
+        history = list(self._screen_history)
+        history.append(line)
+        self._screen_history = history[-12:]
+        self.message = line
+        self.log(f"[ARM] {line}")
+
+    def _sleep_for_screen(self) -> None:
+        remaining = max(0.0, float(self.screen_settle_s))
+        while remaining > 0:
+            self._raise_if_sequence_next()
+            if self._return_ready.is_set() or self._stop.is_set():
+                return
+            step = min(0.05, remaining)
+            time.sleep(step)
+            remaining -= step
+
+    def _capture_progress_frame(self):
+        reader = self.read_screen
+        if not callable(reader):
+            return None
+        frame = None
+        tries = 1 if self.screen_settle_s <= 0 else 3
+        for index in range(tries):
+            if index:
+                self._sleep_for_screen()
+                if self._return_ready.is_set() or self._stop.is_set():
+                    return frame
+            try:
+                shot = reader()
+            except Exception as exc:
+                self.log(f"[ARM][WARN] 屏幕截取失败: {exc}")
+                shot = None
+            if shot is not None and getattr(shot, "size", 0):
+                frame = shot
+        return frame
+
+    def _publish_screen_jpeg(self) -> None:
+        if not callable(self.on_screen_capture):
+            return
+        try:
+            self.on_screen_capture()
+        except Exception as exc:
+            self.log(f"[ARM][WARN] 屏幕截取失败: {exc}")
+
+    def _read_progress_screen(self, label: str) -> bool | None:
+        """Capture one screen. True means it changed, False means the same, None means unreadable."""
+        self._sleep_for_screen()
+        if self._return_ready.is_set() or self._stop.is_set():
+            return None
+        image = self._capture_progress_frame()
+        self._publish_screen_jpeg()
+        if image is not None and hasattr(image, "copy"):
+            image = image.copy()
+        if image is None:
+            self._push_screen_line(f"{label} 没有读到屏幕")
+            return None
+        info = read_panel(image)
+        self._screen_block = dict(info)
+        desc = format_block(info)
+        previous = self._screen_before
+        previous_info = self._screen_before_info
+        self._screen_before = image
+        self._screen_before_info = dict(info)
+        if previous is None or previous_info is None:
+            if label == "动作前":
+                self._push_screen_line(f"{label}。{desc}")
+                return True
+            self._push_screen_line(f"{label} 补上动作前屏幕。{desc}")
+            return None
+        changed = blocks_differ(previous, image, previous_info, info)
+        if changed:
+            # Any visible change counts as a press. A required screen can reject it later.
+            self._push_screen_line(f"{label} 按到了。{desc}")
+        else:
+            self._push_screen_line(f"{label} 屏幕没有变化。{desc}")
+        return changed
+
+    def _screen_attempt_failed(self, label: str, changed: bool | None, attempt: int) -> bool:
+        if changed is True:
+            return False
+        if attempt + 1 >= SCREEN_PRESS_ATTEMPTS:
+            if changed is None:
+                self._push_screen_line(f"{label} 没有读到屏幕，停止")
+            else:
+                self._push_screen_line(f"{label} 屏幕仍无变化，停止")
+            return True
+        if changed is None:
+            self._push_screen_line(f"{label} 没有读到屏幕，重新执行")
+        else:
+            self._push_screen_line(f"{label} 屏幕没有变化，重新执行")
+        return False
+
+    def _hold_after_screen(self, *, arrived: bool) -> None:
+        self._ibvs_enabled = False
+        self._running.clear()
+        self._control_stage = "HOLD"
+        self.phase = "direct_pbvs_complete" if arrived else "direct_pbvs_short"
+
+    def _run_single_press_with_screen(self, telem: dict[str, Any], *, direct: bool) -> None:
+        """One selected button. Look at the screen before it, and again after each try.
+        If the button is pressed, the screen will change.
+        If the button is not pressed, the screen will not change.
+        If the screen is not changed, the button is not pressed.
+        If the screen is changed, the button is pressed.
+        If the button is pressed, the screen will change.
+        If the button is not pressed, the screen will not change.
+        If the screen is not changed, the button is not pressed.
+        If the screen is changed, the button is pressed.
+        """
+        name = str(telem.get("target") or "")
+        if name not in BUTTON_NAMES:
+            self.message = "读取屏幕需要先选择 Button"
+            self.log(f"[ARM] {self.message}")
+            self._hold_after_screen(arrived=False)
+            return
+        label = SEQUENCE_BUTTON_LABELS.get(name, name)
+        self._reset_screen_watch()
+        self._read_progress_screen("动作前")
+        if self._return_ready.is_set() or self._stop.is_set():
+            return
+        attempt = 0
+        while True:
+            if self._return_ready.is_set() or self._stop.is_set():
+                return
+            goal = self._recognize_sequence_button(name)
+            if goal is None:
+                self.phase = "direct_pbvs_rejected"
+                self.message = f"重新识别 {name} 失败，胸口没有看到该按键"
+                self.log(f"[ARM] {self.message}")
+                self._hold_after_screen(arrived=False)
+                return
+            kind = "Direct PBVS" if direct else "Hybrid"
+            self.message = f"{label} {kind}" if not attempt else f"{label} 第 {attempt + 1} 次，{kind}"
+            self.log(f"[ARM] {self.message}")
+            ran = (
+                self._run_direct_sequence_button(name, goal)
+                if direct
+                else self._run_hybrid_button(name, goal) 
+            )
+            if self._return_ready.is_set() or self._stop.is_set():
+                return
+            if not ran:
+                self._hold_after_screen(arrived=False)
+                return
+            self._retreat_clear_of_panel(label)
+            if self._return_ready.is_set() or self._stop.is_set():
+                return
+            changed = self._read_progress_screen(label)
+            if self._return_ready.is_set() or self._stop.is_set():
+                return
+            if changed is True:
+                self._hold_after_screen(arrived=True)
+                return
+            if self._screen_attempt_failed(label, changed, attempt):
+                self._hold_after_screen(arrived=False)
+                return
+            attempt += 1
+
     def _run_button_sequence(self, start_index: int = 0) -> None:
         """Each button is Direct PBVS or Hybrid. Between buttons the arm clears down and right."""
         steps = list(self._button_sequence)
@@ -4850,7 +5106,13 @@ class ArmMover:
             self._sequence_skip = 0
             self._sequence_inside = True
         failed = False
+        cleared = False
         try:
+            if self._screen_progress and start_index <= 0:
+                self._reset_screen_watch()
+                self._read_progress_screen("动作前")
+                if self._return_ready.is_set() or self._stop.is_set():
+                    return
             for index, name in enumerate(steps):
                 if index < start_index:
                     continue
@@ -4858,44 +5120,68 @@ class ArmMover:
                     return
                 self._sequence_index = index
                 label = SEQUENCE_BUTTON_LABELS.get(name, name)
+                attempt = 0
                 try:
-                    if index > 0:
-                        previous = SEQUENCE_BUTTON_LABELS.get(steps[index - 1], steps[index - 1])
-                        self._retreat_clear_of_panel(previous)
+                    while True:
                         if self._return_ready.is_set() or self._stop.is_set():
                             return
-                    self._sequence_stage = f"{label} PBVS"
-                    self.message = f"{label} PBVS"
-                    goal = self._recognize_sequence_button(name)
-                    if goal is None:
-                        self.phase = "direct_pbvs_rejected"
-                        self.message = f"重新识别 {name} 失败，胸口没有看到该按键"
+                        if index > 0 and not cleared:
+                            previous = SEQUENCE_BUTTON_LABELS.get(steps[index - 1], steps[index - 1])
+                            self._retreat_clear_of_panel(previous)
+                            if self._return_ready.is_set() or self._stop.is_set():
+                                return
+                        cleared = False
+                        self._sequence_stage = f"{label} PBVS"
+                        self.message = f"{label} PBVS"
+                        goal = self._recognize_sequence_button(name)
+                        if goal is None:
+                            self.phase = "direct_pbvs_rejected"
+                            self.message = f"重新识别 {name} 失败，胸口没有看到该按键"
+                            self.log(f"[ARM] {self.message}")
+                            failed = True
+                            break
+                        kind = "Direct PBVS" if direct else "Hybrid"
+                        self.message = f"动作 {index + 1}/{len(steps)} {name} {kind}"
+                        if attempt:
+                            self.message = f"{label} 第 {attempt + 1} 次，{kind}"
                         self.log(f"[ARM] {self.message}")
-                        failed = True
-                        break
-                    kind = "Direct PBVS" if direct else "Hybrid"
-                    self.message = f"动作 {index + 1}/{len(steps)} {name} {kind}"
-                    self.log(f"[ARM] {self.message}")
-                    ran = (
-                        self._run_direct_sequence_button(name, goal)
-                        if direct
-                        else self._run_hybrid_button(name, goal)
-                    )
-                    if not ran:
-                        failed = True
-                        break
-                    if self._return_ready.is_set() or self._stop.is_set():
-                        return
-                    self.message = (
-                        f"Direct PBVS 完成，{name} 完成"
-                        if direct
-                        else f"右腕进近完成，{name} 完成"
-                    )
-                    self.log(f"[ARM] {self.message}")
+                        ran = (
+                            self._run_direct_sequence_button(name, goal)
+                            if direct
+                            else self._run_hybrid_button(name, goal)
+                        )
+                        if not ran:
+                            failed = True
+                            break
+                        if self._return_ready.is_set() or self._stop.is_set():
+                            return
+                        if not self._screen_progress:
+                            self.message = (
+                                f"Direct PBVS 完成，{name} 完成"
+                                if direct
+                                else f"右腕进近完成，{name} 完成"
+                            )
+                            self.log(f"[ARM] {self.message}")
+                            break
+                        self._retreat_clear_of_panel(label)
+                        cleared = True
+                        if self._return_ready.is_set() or self._stop.is_set():
+                            return
+                        changed = self._read_progress_screen(label)
+                        if self._return_ready.is_set() or self._stop.is_set():
+                            return
+                        if changed is True:
+                            break
+                        if self._screen_attempt_failed(label, changed, attempt):
+                            failed = True
+                            break
+                        attempt += 1
                 except SequenceNext:
                     if index + 1 >= len(steps):
                         break
                     continue
+                if failed:
+                    break
             if self._return_ready.is_set() or self._stop.is_set():
                 return
             if failed:
@@ -4982,10 +5268,10 @@ class ArmMover:
             return None
         return target
 
-    def _service_coarse_target(self) -> tuple[float, float, float] | None:
+    def _service_coarse_target(self) -> tuple[float, float, float] | None: # pylint: disable=unused-argument
         return self._fresh_torso_target()
 
-    def _direct_pbvs_via_service(self, goal: tuple[float, float, float]) -> None:
+    def _direct_pbvs_via_service(self, goal: tuple[float, float, float]) -> None: # this function is used to move the arm to the button
         """Service Cartesian to the button. A low start rises before it advances."""
         rpy = tuple(float(value) for value in DIRECT_EE_RPY_DEG)
         distance = self._tip_distance_to(goal)

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Foreground Flask + joint sidecar + h2_arm_service_node.
-# Ctrl+C lowers the arm, then stops the service node. Use --detach only for SSH deploy.
+# Foreground Flask + joint sidecar. h2_arm_service_node is not started here.
+# The Service button starts that node; the arm_sdk button enables arm_sdk.
+# Ctrl+C lowers the arm, then stops a service node if one is up. Use --detach only for SSH deploy.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=env.sh
@@ -19,6 +20,13 @@ while [ "$#" -gt 0 ]; do
   EXTRA+=("$1")
   shift
 done
+
+if [ "$DETACH" -eq 0 ]; then
+  # shellcheck source=session_log.sh
+  . "$ROOT/scripts/session_log.sh"
+  session_log_begin "${IBVS_LOG_DIR:-$ROOT/logs}"
+  trap session_log_finish EXIT
+fi
 
 if [ -r /proc/version ] && grep -qi microsoft /proc/version; then
   echo "[ibvs] this is WSL, not the H2. ssh unitree@192.168.1.3 then run this script." >&2
@@ -83,6 +91,7 @@ stop_h2_arm_service() {
   rm -f /tmp/ibvs_h2_arm_service.pid
 }
 
+# Kept for a manual recovery shell. Boot does not call this.
 start_h2_arm_service() {
   if [ ! -f /opt/ros/humble/setup.bash ] || [ ! -f "${HOME}/h2arm_control_ws/install/setup.bash" ]; then
     echo "[ibvs] WARN: skip h2_arm_service_node; ROS humble or ~/h2arm_control_ws/install is missing" >&2
@@ -129,6 +138,7 @@ stop_pidfile /tmp/ibvs_web.pid
 stop_pidfile /tmp/ibvs_joints.pid
 stop_pidfile /tmp/ibvs_cam_chest.pid
 stop_pidfile /tmp/ibvs_cam_d435i.pid
+echo "[ibvs] h2_arm_service_node is not started at boot. Stopping a leftover node from the last run."
 stop_h2_arm_service
 
 JOINT_PY="$PY"
@@ -195,6 +205,7 @@ cleanup() {
         /tmp/ibvs_cam_chest.jpg /tmp/ibvs_cam_chest.ppm /tmp/ibvs_cam_chest.bgr \
         /tmp/ibvs_cam_d435i.jpg /tmp/ibvs_cam_d435i.ppm /tmp/ibvs_cam_d435i.bgr \
         /tmp/ibvs_cam_seen.txt /tmp/ibvs_depth_chest.bin /tmp/ibvs_depth_d435i.bin
+  session_log_finish
 }
 
 clear_camera_files() {
@@ -282,7 +293,7 @@ fi
 unset _cam_pick
 
 if [ "$DETACH" -eq 1 ]; then
-  start_h2_arm_service
+  echo "[ibvs] h2_arm_service_node stays down until the Service button."
   PYTHONPATH="${IBVS_WEB_PYTHONPATH}" nohup "$JOINT_PY" "$ROOT/scripts/joint_sidecar.py" eth0 > /tmp/ibvs_joints.log 2>&1 &
   echo $! > /tmp/ibvs_joints.pid
   if [ -n "${CAM_PY:-}" ]; then
@@ -300,13 +311,12 @@ if [ "$DETACH" -eq 1 ]; then
   echo $! > /tmp/ibvs_web.pid
   echo "detached web=$(cat /tmp/ibvs_web.pid) port=${PORT}"
   sleep 1.2
-  wait_h2_arm_service
   tail -n 20 /tmp/ibvs_web.log || true
   exit 0
 fi
 
 trap cleanup EXIT INT TERM
-echo "[ibvs] foreground  Ctrl+C stops web + joints + cameras + h2_arm_service"
+echo "[ibvs] foreground  Ctrl+C stops web + joints + cameras, and a Service node if one was started"
 echo "[ibvs] joints py=${JOINT_PY}"
 echo "[ibvs] web    py=${PY}  http://0.0.0.0:${PORT}/"
 if PYTHONPATH="${IBVS_WEB_PYTHONPATH}" "$PY" -c "import cyclonedds._clayer" >/dev/null 2>&1; then
@@ -315,11 +325,9 @@ else
   echo "[ibvs] WARN: ${PY} has no cyclonedds._clayer; Start cannot raise the arm" >&2
   echo "[ibvs] export PYTHONPATH=/home/unitree/.local/lib/python3.10/site-packages:/usr/lib/python3/dist-packages:/home/unitree/MscapeTech/unitree_sdk2_python:\$PYTHONPATH" >&2
 fi
-echo "[ibvs] Start will raise the right arm (--confirm-arm-motion). AI stand first."
-echo "[ibvs] Ctrl+C lowers the right arm (~8s), then stops h2_arm_service_node."
-start_h2_arm_service
+echo "[ibvs] arm_sdk and h2_arm_service_node stay down until their buttons. AI stand first."
+echo "[ibvs] Ctrl+C lowers the right arm (~8s), then stops h2_arm_service_node if Service was used."
 start_camera_sidecars
-wait_h2_arm_service
 
 PYTHONPATH="${IBVS_WEB_PYTHONPATH}" PYTHONUNBUFFERED=1 "$JOINT_PY" "$ROOT/scripts/joint_sidecar.py" eth0 \
   > >(sed -u 's/^/[joints] /') 2>&1 &

@@ -7,6 +7,7 @@ on Stop, release, reset, or when the switch is turned off.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 import time
@@ -19,6 +20,18 @@ import numpy as np
 
 VIDEO_HZ = 10.0
 KEYFRAME_S = 1.0
+
+
+def trajectory_label(text: str) -> str:
+    """One path segment: custom name, no slashes. Empty when the name is blank."""
+    raw = str(text or "").strip().replace("\\", "/")
+    raw = raw.split("/")[-1]
+    cleaned = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", raw, flags=re.UNICODE)
+    cleaned = cleaned.replace("..", "_")
+    cleaned = re.sub(r"_+", "_", cleaned).strip("._")
+    if not cleaned or cleaned in {".", ".."}:
+        return ""
+    return cleaned[:40]
 
 
 def slim_trajectory(state: dict[str, Any], now: float | None = None) -> dict[str, Any]:
@@ -245,14 +258,22 @@ class MotionTrajectoryRecorder:
         self.hz = max(5.0, float(hz))
         self._lock = threading.RLock()
         self._enabled = False
+        self._label = ""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._session: Path | None = None
         self._started_at = 0.0
         self._samples = 0
 
-    def set_enabled(self, enabled: bool) -> dict[str, Any]:
+    def set_name(self, name: str) -> dict[str, Any]:
         with self._lock:
+            self._label = trajectory_label(name)
+        return self.status()
+
+    def set_enabled(self, enabled: bool, name: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            if name is not None:
+                self._label = trajectory_label(name)
             self._enabled = bool(enabled)
         if not enabled:
             self.end("disabled")
@@ -263,17 +284,23 @@ class MotionTrajectoryRecorder:
         state_fn: Callable[[], dict[str, Any]],
         *,
         target: str,
+        name: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
+            if name is not None:
+                self._label = trajectory_label(name)
             if not self._enabled:
                 return self.status()
+            label = self._label
         self.end("new_start")
         stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
-        session = self.root / stamp
+        folder_id = f"{label}_{stamp}" if label else stamp
+        session = self.root / folder_id
         session.mkdir(parents=True, exist_ok=True)
         started = time.time()
         meta = {
-            "id": stamp,
+            "id": folder_id,
+            "name": label,
             "target": str(target),
             "started_at": started,
             "hz": self.hz,
@@ -334,6 +361,7 @@ class MotionTrajectoryRecorder:
             recording = self._thread is not None and self._thread.is_alive()
             return {
                 "enabled": self._enabled,
+                "name": self._label,
                 "recording": recording,
                 "id": None if self._session is None else self._session.name,
                 "dir": None if self._session is None else str(self._session),

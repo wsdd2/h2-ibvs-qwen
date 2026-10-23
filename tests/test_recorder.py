@@ -74,6 +74,32 @@ def test_slim_trajectory_keeps_servo_fields():
     assert slim["joints"] == []
 
 
+def test_motion_trajectory_name_is_prefixed_to_the_timestamp(tmp_path):
+    import re
+
+    from ibvs_pad_touch.web.recorder import trajectory_label
+
+    assert trajectory_label("  按钮1 poke ") == "按钮1_poke"
+    assert trajectory_label("../secret") == "secret"
+    assert trajectory_label("") == ""
+    recorder = MotionTrajectoryRecorder(tmp_path, hz=50)
+    recorder.set_enabled(True, name="按钮1 poke")
+    state = {
+        "target": "button_1",
+        "upper_body": {"joints": [{"name": "right_elbow_joint", "group": "right_arm", "q": 0.1}]},
+    }
+    recorder.begin(lambda: state, target="button_1")
+    try:
+        status = recorder.status()
+        assert status["name"] == "按钮1_poke"
+        assert re.fullmatch(r"按钮1_poke_\d{8}_\d{6}_\d{3}", status["id"] or "")
+    finally:
+        recorder.end("done")
+    rows = recorder.list()
+    assert rows[0]["name"] == "按钮1_poke"
+    assert rows[0]["id"].startswith("按钮1_poke_")
+
+
 def test_motion_trajectory_records_pause_samples_and_can_reload(tmp_path):
     recorder = MotionTrajectoryRecorder(tmp_path, hz=50)
     state = {
@@ -91,6 +117,7 @@ def test_motion_trajectory_records_pause_samples_and_can_reload(tmp_path):
             ]
         },
     }
+    recorder.set_enabled(True)
     recorder.begin(lambda: state, target="button_2")
     deadline = time.time() + 1.0
     while time.time() < deadline and recorder.status()["samples"] < 3:
@@ -123,6 +150,7 @@ def test_motion_trajectory_delete_rejects_bad_ids_and_active_takes(tmp_path):
         "target": "button_1",
         "upper_body": {"joints": [{"name": "right_elbow_joint", "group": "right_arm", "q": 0.1}]},
     }
+    recorder.set_enabled(True)
     recorder.begin(lambda: state, target="button_1")
     active = recorder.status()["id"]
     try:
@@ -160,6 +188,7 @@ def test_motion_trajectory_delete_all_keeps_the_active_take(tmp_path):
         "target": "button_1",
         "upper_body": {"joints": [{"name": "right_elbow_joint", "group": "right_arm", "q": 0.1}]},
     }
+    recorder.set_enabled(True)
     recorder.begin(lambda: state, target="button_1")
     active = recorder.status()["id"]
     deadline = time.time() + 1.0

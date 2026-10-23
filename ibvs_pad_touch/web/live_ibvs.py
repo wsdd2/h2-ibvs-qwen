@@ -181,7 +181,7 @@ def load_eye_in_hand_transform(path: Path | None) -> tuple[np.ndarray | None, di
     }
 
 
-def screen_mask_jpeg(bgr: np.ndarray | None, polygon) -> bytes | None:
+def screen_crop(bgr: np.ndarray | None, polygon) -> np.ndarray | None:
     """Keep the YOLO screen mask and black out everything around it."""
     if bgr is None or polygon is None:
         return None
@@ -202,6 +202,13 @@ def screen_mask_jpeg(bgr: np.ndarray | None, polygon) -> bytes | None:
         return None
     crop = bgr[y : y + h, x : x + w].copy()
     crop[mask[y : y + h, x : x + w] == 0] = 0
+    return crop
+
+
+def screen_mask_jpeg(bgr: np.ndarray | None, polygon) -> bytes | None:
+    crop = screen_crop(bgr, polygon)
+    if crop is None:
+        return None
     ok, blob = cv2.imencode(".jpg", crop)
     if not ok:
         return None
@@ -1023,14 +1030,27 @@ class LiveIbvsAnnotator:
             return None
         return np.asarray(self.cam2hand, dtype=np.float64).copy()
 
-    def screen_jpeg(self) -> bytes | None:
+    def _screen_view(self):
         with self._lock:
             bgr = None if self._last_chest_bgr is None else self._last_chest_bgr.copy()
             polygon = None if self._last_screen_polygon is None else list(self._last_screen_polygon)
             if bgr is None or polygon is None:
                 bgr = None if self._last_side_bgr is None else self._last_side_bgr.copy()
                 polygon = None if self._last_side_screen is None else list(self._last_side_screen)
-        return screen_mask_jpeg(bgr, polygon)
+        return bgr, polygon
+
+    def screen_bgr(self) -> np.ndarray | None:
+        bgr, polygon = self._screen_view()
+        return screen_crop(bgr, polygon)
+
+    def screen_jpeg(self) -> bytes | None:
+        crop = self.screen_bgr()
+        if crop is None:
+            return None
+        ok, blob = cv2.imencode(".jpg", crop)
+        if not ok:
+            return None
+        return blob.tobytes()
 
     def _buttons_torso(self, loc) -> dict[str, list[float]]:
         out: dict[str, list[float]] = {}

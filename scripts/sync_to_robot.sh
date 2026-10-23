@@ -40,6 +40,7 @@ rsync -az --info=progress2 \
   --exclude '.pytest_cache/' \
   --exclude '__pycache__/' \
   --exclude 'outputs/' \
+  --exclude 'logs/' \
   --exclude '.git/' \
   --exclude '*.pyc' \
   "$ROOT/" "$HOST:$DEST/"

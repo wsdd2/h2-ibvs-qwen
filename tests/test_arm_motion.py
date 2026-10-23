@@ -571,6 +571,25 @@ def test_web_mode_buttons_select_direct_pbvs_or_hybrid_for_the_next_start():
     assert "Pause" in kept
 
 
+def test_motion_stays_idle_until_a_backend_is_clicked():
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None, motion_backend="")
+    mover._service_node_probe = lambda: False
+    assert mover.status()["motion_backend"] == ""
+    refused = mover.start()
+    assert "请先点" in refused
+    assert mover.controller is None
+    failed = []
+    mover._start_arm_sdk = lambda: failed.append("sdk") or False
+    missed = mover.set_motion_backend("arm_sdk")
+    assert failed == ["sdk"]
+    assert "没有起来" in missed
+    assert mover.status()["motion_backend"] == ""
+    mover._start_arm_sdk = lambda: True
+    picked = mover.set_motion_backend("arm_sdk")
+    assert "拉起 arm_sdk" in picked
+    assert mover.status()["motion_backend"] == "arm_sdk"
+
+
 def test_motion_backend_switches_from_idle_and_refuses_a_running_move():
     mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
     mover._service_node_probe = lambda: True
@@ -595,8 +614,12 @@ def test_arm_sdk_click_stops_the_service_node_even_when_already_selected():
         return True
 
     mover._stop_service_node = _stop
+    started = []
+    mover._start_arm_sdk = lambda: started.append(True) or True
     message = mover.set_motion_backend("arm_sdk")
+    assert started == [True]
     assert "已停止运控服务" in message
+    assert "拉起 arm_sdk" in message
     assert "拒绝" not in message
     assert mover.status()["motion_backend"] == "arm_sdk"
 
@@ -797,6 +820,7 @@ def test_arm_sdk_motion_refuses_while_the_service_node_is_up():
 
     mover._stop_service_node = _stop_clears
     mover._service_node_cached = None
+    mover._start_arm_sdk = lambda: True
     switched = mover.set_motion_backend("arm_sdk")
     assert "已停止运控服务" in switched
     assert "拒绝" not in switched

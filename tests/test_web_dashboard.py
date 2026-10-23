@@ -242,8 +242,13 @@ def test_flask_page_has_reserved_buttons_and_state():
     assert "depthHover(event)" in html
     assert 'id="trajectorySelect"' in html
     assert 'id="trajectoryToggle"' in html
+    assert 'id="trajectoryName"' in html
     assert 'id="sequenceList"' in html
     assert 'id="screenShot"' in html
+    assert 'id="shadow-actual-x"' in html
+    assert 'id="shadow-vit-x"' in html
+    assert "ViT shadow 对照" in html
+    assert "/shadow/reference" in html
     assert "/trajectories/play" in html
     assert "/trajectories/delete" in html
     assert "删除所选轨迹" in html
@@ -400,9 +405,15 @@ def test_sequence_route_and_trajectory_switch():
     client = dash.app.test_client()
     state = client.get("/state").get_json()
     assert state["trajectory"]["enabled"] is False
+    assert state["arm"]["motion_backend"] == ""
+    assert state["arm"]["screen_progress"] is False
     assert state["screen"]["ready"] is False
-    enabled = client.post("/trajectories/enabled", json={"enabled": True}).get_json()
+    assert state["screen"]["progress"] is False
+    blocked = client.post("/command", json={"command": "start"}).get_json()
+    assert "请先点" in (blocked["state"]["message"] or "")
+    enabled = client.post("/trajectories/enabled", json={"enabled": True, "name": "按钮1 poke"}).get_json()
     assert enabled["trajectory"]["enabled"] is True
+    assert enabled["trajectory"]["name"] == "按钮1_poke"
     posted = client.post(
         "/sequence",
         json={"steps": ["button_1", "button_2", "button_1", "button_3", "button_9"]},
@@ -415,6 +426,14 @@ def test_sequence_route_and_trajectory_switch():
     assert "向下、向右" in html
     assert "sequence_direct_pbvs" in html
     assert "sequence_hybrid" in html
+    assert 'id="screenProgressToggle"' in html
+    assert "读取屏幕判断进度" in html
+    opened = client.post("/screen_progress", json={"enabled": True}).get_json()
+    assert opened["ok"] is True
+    assert opened["arm"]["screen_progress"] is True
+    assert "开" in (opened["message"] or "")
+    closed = client.post("/screen_progress", json={"enabled": False}).get_json()
+    assert closed["arm"]["screen_progress"] is False
     chosen = client.post("/command", json={"command": "sequence_direct_pbvs"}).get_json()
     assert chosen["ok"] is True
     assert "Direct PBVS" in (chosen["state"]["message"] or "")
@@ -512,3 +531,42 @@ def test_eye_bias_form_defaults_to_startup_arguments_and_submit_replaces_them():
     assert updated["eye_to_hand_bias_m"] == {"x": 0.01, "y": 0.0, "z": 0.04}
     rejected = client.post("/eye_to_hand_bias", json={"x_m": "nope", "y_m": 0, "z_m": 0})
     assert rejected.status_code == 400
+
+
+def test_shadow_panel_compares_without_changing_the_command():
+    class _Shift:
+        name = "fake"
+
+        def describe(self, bgr):
+            base = np.zeros((4, 5, 20), dtype=np.float64)
+            for index in range(20):
+                row, col = divmod(index, 5)
+                base[row, col, index] = 1.0
+            if float(bgr.mean()) < 1.0:
+                return base
+            moved = np.zeros_like(base)
+            moved[:, 1:] = base[:, :-1]
+            moved[:, 0, -1] = 1.0
+            return moved
+
+    dash = RealRobotDashboard(host="127.0.0.1", port=0, demo=True, autostart_camera=False)
+    dash.shadow._extractor = _Shift()
+    client = dash.app.test_client()
+    idle = client.get("/state").get_json()
+    assert idle["shadow"]["applied"] is False
+    assert idle["arm"]["wrist_command_step_m"] is None
+    worker = dash.cameras["d435i"]
+    worker._publish(np.zeros((48, 64, 3), dtype=np.uint8), "running")
+    saved = client.post("/shadow/reference").get_json()
+    assert saved["ok"] is True
+    assert saved["shadow"]["reference"] is True
+    assert saved["shadow"]["applied"] is False
+    worker._publish(np.full((48, 64, 3), 255, dtype=np.uint8), "running")
+    dash.arm._wrist_ibvs_step = (0.001, 0.0, 0.0)
+    compared = dash.shadow.refresh()
+    assert compared["applied"] is False
+    state = client.get("/state").get_json()
+    assert state["shadow"]["actual_step_mm"][0] == 1.0
+    assert state["shadow"]["shadow_step_mm"][0] > 0.0
+    assert state["arm"]["wrist_command_step_m"] == [0.001, 0.0, 0.0]
+    dash.shadow.close()

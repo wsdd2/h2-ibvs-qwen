@@ -18,6 +18,7 @@ from ibvs_pad_touch.camera.devices import read_seen
 from ibvs_pad_touch.camera.image_io import pick_sidecar, read_depth, read_image
 from ibvs_pad_touch.camera.realsense_bind import usable_realsense as _usable_realsense
 from ibvs_pad_touch.config import camera_views, load_camera_config
+from ibvs_pad_touch.servo.vit_shadow_feed import ShadowMonitor
 from ibvs_pad_touch.web.joints import UpperBodyJointReader
 from ibvs_pad_touch.web.recorder import MotionTrajectoryRecorder, SessionRecorder
 
@@ -532,6 +533,7 @@ class RealRobotDashboard:
             pbvs_step_m=pbvs_step_m,
             pbvs_step_seconds=pbvs_step_seconds,
             pbvs_max_joint_deg=pbvs_max_joint_deg,
+            motion_backend="",
         )
         if self.ibvs is not None:
             self.ibvs.set_side_ready(lambda: bool(self.arm.status().get("left_side_ready")))
@@ -541,6 +543,7 @@ class RealRobotDashboard:
             self.arm.wrist_view = self.ibvs.wrist_pbvs_view
             self.arm.cam2hand_matrix = self.ibvs.cam2hand_matrix
             self.arm.on_screen_capture = self._capture_screen
+            self.arm.read_screen = self._read_screen_bgr
             self.arm.on_select_target = self.ibvs.set_target
             self.arm.on_reidentify = self.ibvs.forget_button_lock
         self._screen_jpeg: bytes | None = None
@@ -554,6 +557,12 @@ class RealRobotDashboard:
         self._commands: list[dict[str, Any]] = []
         self._last_command: dict[str, Any] | None = None
         self._message = "按钮已预留，尚未接入实机 IBVS 伺服"
+        self.shadow = ShadowMonitor(
+            frame_fn=self._shadow_frame,
+            depth_fn=self._shadow_depth,
+            actual_fn=self._shadow_actual,
+            intrinsics_fn=self._shadow_intrinsics,
+        )
         self._configure_routes()
         if autostart_camera:
             for worker in self.cameras.values():
@@ -596,6 +605,7 @@ class RealRobotDashboard:
                 pass
         self.recorder.end()
         self.motion_trajectories.end("shutdown")
+        self.shadow.close()
         self.arm.shutdown()
 
     def pop_command(self) -> Optional[dict[str, Any]]:
@@ -734,8 +744,14 @@ class RealRobotDashboard:
         payload["arm"] = self.arm.status()
         payload["record"] = self.recorder.status()
         payload["trajectory"] = self.motion_trajectories.status()
-        payload["screen"] = {"ready": self._screen_jpeg is not None, "at": self._screen_at}
+        payload["screen"] = {
+            "ready": self._screen_jpeg is not None,
+            "at": self._screen_at,
+            "progress": bool(payload["arm"].get("screen_progress")),
+            "report": payload["arm"].get("screen_report") or "",
+        }
         payload["eye_to_hand_bias_m"] = self._eye_bias_payload()
+        payload["shadow"] = self.shadow.status()
         payload["updated_at"] = time.time()
         return payload
 
@@ -747,6 +763,50 @@ class RealRobotDashboard:
             y_m = float(eye["torso_y_bias_m"])
             z_m = float(eye["torso_z_bias_m"])
         return {"x": round(x_m, 6), "y": round(y_m, 6), "z": round(z_m, 6)}
+
+    def _shadow_frame(self):
+        worker = self.cameras.get("d435i")
+        if worker is None:
+            return None
+        blob = worker.raw_jpeg()
+        if not blob:
+            return None
+        return cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+    def _shadow_depth(self):
+        path = DEPTH_PATHS.get("d435i")
+        return None if path is None else read_depth(path)
+
+    def _shadow_actual(self):
+        return self.arm.status().get("wrist_command_step_m")
+
+    def _shadow_intrinsics(self) -> dict[str, float]:
+        info = {"fx": 615.0, "fy": 615.0, "cx": 320.0, "cy": 240.0, "plane_z_m": 0.2, "depth_assumed": 1.0}
+        if self.ibvs is None:
+            return info
+        try:
+            view = self.ibvs.wrist_pbvs_view()
+        except Exception:
+            return info
+        intrinsics = view.get("intrinsics") or {}
+        info["fx"] = float(intrinsics.get("fx") or info["fx"])
+        info["fy"] = float(intrinsics.get("fy") or info["fy"])
+        info["cx"] = float(intrinsics.get("cx") or info["cx"])
+        info["cy"] = float(intrinsics.get("cy") or info["cy"])
+        plane = view.get("target_z_m")
+        if plane is None:
+            plane = view.get("tip_z_m")
+        if plane is not None and np.isfinite(float(plane)) and float(plane) > 0.02:
+            info["plane_z_m"] = float(plane)
+            info["depth_assumed"] = 0.0
+        return info
+
+    def _read_screen_bgr(self):
+        if self.ibvs is None:
+            return None
+        image = self.ibvs.screen_bgr()
+        self._capture_screen()
+        return image
 
     def _capture_screen(self) -> None:
         jpeg = None if self.ibvs is None else self.ibvs.screen_jpeg()
@@ -769,6 +829,30 @@ class RealRobotDashboard:
         @self._app.get("/state")
         def state() -> Response:
             return jsonify(self.state())
+
+        @self._app.post("/shadow/reference")
+        def shadow_reference() -> Response:
+            frame = self._shadow_frame()
+            if frame is None:
+                return jsonify({"ok": False, "error": "还没有右腕画面"}), 409
+            try:
+                payload = self.shadow.capture_reference(frame)
+            except ValueError as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 400
+            return jsonify({"ok": True, "shadow": payload})
+
+        @self._app.post("/shadow/clear")
+        def shadow_clear() -> Response:
+            return jsonify({"ok": True, "shadow": self.shadow.clear_reference()})
+
+        @self._app.post("/shadow/run")
+        def shadow_run() -> Response:
+            body = request.get_json(silent=True) or {}
+            return jsonify({"ok": True, "shadow": self.shadow.set_running(bool(body.get("enabled", True)))})
+
+        @self._app.post("/shadow/once")
+        def shadow_once() -> Response:
+            return jsonify({"ok": True, "shadow": self.shadow.request_once()})
 
         @self._app.get("/stream.mjpg")
         def stream() -> Response:
@@ -875,6 +959,13 @@ class RealRobotDashboard:
             resp.headers["Cache-Control"] = "no-store"
             return resp
 
+        @self._app.post("/screen_progress")
+        def screen_progress() -> Response:
+            payload = request.get_json(silent=True) or {}
+            message = self.arm.set_screen_progress(bool(payload.get("enabled")))
+            self._message = message
+            return jsonify({"ok": True, "message": message, "arm": self.arm.status()})
+
         @self._app.post("/record")
         def record() -> Response:
             payload = request.get_json(silent=True) or {}
@@ -884,7 +975,11 @@ class RealRobotDashboard:
         @self._app.post("/trajectories/enabled")
         def trajectories_enabled() -> Response:
             payload = request.get_json(silent=True) or {}
-            status = self.motion_trajectories.set_enabled(bool(payload.get("enabled")))
+            name = payload.get("name") if "name" in payload else None
+            if "enabled" not in payload and name is not None:
+                status = self.motion_trajectories.set_name(str(name))
+            else:
+                status = self.motion_trajectories.set_enabled(bool(payload.get("enabled")), name=name)
             return jsonify({"ok": True, "trajectory": status})
 
         @self._app.post("/sequence")
@@ -1109,6 +1204,11 @@ PAGE_HTML = """<!doctype html>
     .record-toggle input:checked + .track{background:#9b2c2c}
     .record-toggle input:checked + .track::after{transform:translateX(18px)}
     .hint{color:#888;font-size:12px;line-height:1.45}
+    .shadow-box{margin:10px 0;padding:10px;border:1px solid #4d4568;border-radius:7px;background:#16131c}
+    .shadow-box table{width:100%;border-collapse:collapse;font:12px Consolas,monospace}
+    .shadow-box td{padding:3px 4px;border-bottom:1px solid #2c2836}
+    .shadow-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+    .shadow-actions button{padding:6px 8px;background:#3a3158}
     .manual{margin:10px 0;padding:10px;border:1px solid #3b4b58;border-radius:7px;background:#121a20}
     .manual-title{display:flex;justify-content:space-between;align-items:center;color:#9fd0ff;font-size:13px;margin-bottom:8px}
     .manual-grid{display:grid;grid-template-columns:74px 1fr 1fr;gap:6px;align-items:center}
@@ -1118,7 +1218,7 @@ PAGE_HTML = """<!doctype html>
     .manual select{background:#222;color:#eee;border:1px solid #555;border-radius:4px;padding:3px}
     .trajectory-box{margin:10px 0;padding:10px;border:1px solid #66513b;border-radius:7px;background:#1b1712}
     .trajectory-row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
-    .trajectory-row select{min-width:190px;background:#222;color:#eee;border:1px solid #555;border-radius:4px;padding:5px}
+    .trajectory-row select,.trajectory-row input[type="text"]{min-width:190px;background:#222;color:#eee;border:1px solid #555;border-radius:4px;padding:5px}
     .trajectory-row button{background:#725126;padding:6px 9px}
     .trajectory-row button.danger{background:#6d2a2a}
     .sequence-box{margin:10px 0;padding:10px;border:1px solid #3d5a48;border-radius:7px;background:#121a16}
@@ -1184,6 +1284,7 @@ PAGE_HTML = """<!doctype html>
             <a id="screenDownload" href="/screen/latest.jpg?download=1">Download</a>
             <span id="screenStatus">no screen yet</span>
           </div>
+          <div id="screenReport" class="hint"></div>
         </div>
       </div>
     </div>
@@ -1208,7 +1309,7 @@ PAGE_HTML = """<!doctype html>
     </div>
   </div>
   <div class="panel">
-    <div class="hint">Hybrid VS：胸口 PBVS 粗定位，右腕图像 IBVS 把按钮对准夹爪尖后进近，并由右腕视觉确认接触。选择按钮后 Start；No Raise required。arm_sdk 和 h2_arm_service_node 均保留；运动中不要切换控制链路，only after Release 才切换正在占用的链路。Reset 和 Ctrl+C 会放下双臂。</div>
+    <div class="hint">Hybrid VS：胸口 PBVS 粗定位，右腕图像 IBVS 把按钮对准夹爪尖后进近，并由右腕视觉确认接触。选择按钮后 Start；No Raise required。先点 arm_sdk 或 Service，对应链路才会拉起；未选择时 Start / Raise / Reset 不会动手臂。运动中不要切换控制链路，only after Release 才切换正在占用的链路。Reset 和 Ctrl+C 会放下双臂。</div>
     <div class="controls">
       <button class="b1" data-cmd="button_1" onclick="send('button_1',this)">Button 1</button>
       <button class="b2" data-cmd="button_2" onclick="send('button_2',this)">Button 2</button>
@@ -1216,8 +1317,8 @@ PAGE_HTML = """<!doctype html>
       <button class="cycle" data-cmd="cycle" onclick="send('cycle',this)">Cycle</button>
       <button class="mode" data-cmd="mode_direct_pbvs" onclick="send('mode_direct_pbvs',this)">Direct PBVS</button>
       <button class="mode" data-cmd="mode_hybrid" onclick="send('mode_hybrid',this)">Hybrid VS</button>
-      <button class="mode" data-cmd="backend_arm_sdk" onclick="send('backend_arm_sdk',this)">arm_sdk</button>
-      <button class="mode" data-cmd="backend_service" onclick="send('backend_service',this)">Service</button>
+      <button class="mode" data-cmd="backend_arm_sdk" onclick="send('backend_arm_sdk',this)" title="点击后才拉起 arm_sdk">arm_sdk</button>
+      <button class="mode" data-cmd="backend_service" onclick="send('backend_service',this)" title="点击后才启动 h2_arm_service_node">Service</button>
       <button class="scan" data-cmd="scan" onclick="send('scan',this)">Raise</button>
       <button class="scan" data-cmd="level_right" onclick="send('level_right',this)" title="已关闭，不会动右臂">Right level off</button>
       <button class="snap" onclick="captureStill()">截图</button>
@@ -1265,6 +1366,9 @@ PAGE_HTML = """<!doctype html>
           <span class="track"></span>
           <span id="trajectoryRecordLabel">轨迹关</span>
         </label>
+        <label>名称
+          <input id="trajectoryName" type="text" maxlength="40" placeholder="可选，保存为 名称_时间戳" oninput="queueTrajectoryName(this.value)"/>
+        </label>
       </div>
       <div class="trajectory-row">
         <select id="trajectorySelect"><option value="">暂无轨迹</option></select>
@@ -1284,11 +1388,16 @@ PAGE_HTML = """<!doctype html>
         <button class="danger" onclick="deleteTrajectory()">删除所选轨迹</button>
         <button class="danger" onclick="deleteAllTrajectories()">删除全部轨迹</button>
       </div>
-      <div class="hint">默认关。打开后 Start 才录制；Pause 微调继续记录；切换 Button 或释放双臂时保存。</div>
+      <div class="hint">默认关。打开后 Start 才录制；名称可空，填写后保存为「名称_年月日_时分秒_毫秒」。Pause 微调继续记录；切换 Button 或释放双臂时保存。</div>
     </div>
     <div class="sequence-box">
       <div class="manual-title"><span>动作组合</span><span id="sequence-status">空</span></div>
       <div class="trajectory-row">
+        <label class="record-toggle" title="默认关闭。打开后，第一次动作前截取屏幕；每按一次再截取。有变化才算按到，并输出黑块；没有变化就重做这一下。">
+          <input id="screenProgressToggle" type="checkbox" onchange="setScreenProgress(this.checked)"/>
+          <span class="track"></span>
+          <span id="screenProgressLabel">读取屏幕判断进度：关</span>
+        </label>
         <button type="button" class="mode" data-cmd="sequence_direct_pbvs" onclick="send('sequence_direct_pbvs', this)">Direct PBVS</button>
         <button type="button" class="mode" data-cmd="sequence_hybrid" onclick="send('sequence_hybrid', this)">Hybrid</button>
         <button type="button" onclick="addSequence('button_1')">+ Button 1</button>
@@ -1298,7 +1407,7 @@ PAGE_HTML = """<!doctype html>
         <button type="button" onclick="send('sequence_next', this)">Next Step</button>
       </div>
       <ol class="sequence-list" id="sequenceList"></ol>
-      <div class="hint">拖动排序，可以重复。先选 Direct PBVS 或 Hybrid，再点上面的「组合启动」。Direct PBVS 每颗一次到位；Hybrid 是胸口 PBVS 再右腕进近。组合为空会报错。Start 仍只按当前选中的一颗，并使用上面的模式按钮。做完一个动作后，右臂向下、向右移出面板，胸口重新识别，再做下一颗。已经按到但没检测到时，点 Next Step 会立刻移开手臂并进入下一颗；已经是最后一颗则放下右臂并释放控制。</div>
+      <div class="hint">拖动排序，可以重复。先选 Direct PBVS 或 Hybrid，再点上面的「组合启动」。Direct PBVS 每颗一次到位；Hybrid 是胸口 PBVS 再右腕进近。组合为空会报错。Start 仍只按当前选中的一颗，并使用上面的模式按钮。做完一个动作后，右臂向下、向右移出面板，胸口重新识别，再做下一颗。已经按到但没检测到时，点 Next Step 会立刻移开手臂并进入下一颗；已经是最后一颗则放下右臂并释放控制。读取屏幕判断进度默认关闭。打开后，组合和单次 Start 都会在第一下之前截屏，每按一次再截屏：屏幕变了就输出黑块，没变就重做刚才那一下，最多三次。</div>
     </div>
     <div id="pills"></div>
     <div class="hint" id="message">loading…</div>
@@ -1344,6 +1453,27 @@ PAGE_HTML = """<!doctype html>
         <tr><td>handeye</td><td id="ibvs-handeye">—</td></tr>
       </tbody>
     </table>
+    <div class="shadow-box">
+      <div class="manual-title"><span>ViT shadow 对照</span><span id="shadow-state">未接入控制</span></div>
+      <table>
+        <tbody>
+          <tr><td></td><td>当前 IBVS</td><td>Shadow</td><td>Shadow−当前</td></tr>
+          <tr><td>dx mm</td><td id="shadow-actual-x">—</td><td id="shadow-vit-x">—</td><td id="shadow-delta-x">—</td></tr>
+          <tr><td>dy mm</td><td id="shadow-actual-y">—</td><td id="shadow-vit-y">—</td><td id="shadow-delta-y">—</td></tr>
+          <tr><td>dz mm</td><td id="shadow-actual-z">—</td><td id="shadow-vit-z">—</td><td id="shadow-delta-z">—</td></tr>
+          <tr><td>匹配</td><td colspan="3" id="shadow-matches">—</td></tr>
+          <tr><td>转角建议</td><td colspan="3" id="shadow-rotation">—</td></tr>
+        </tbody>
+      </table>
+      <div class="shadow-actions">
+        <button type="button" onclick="shadowReference()">记下当前右腕</button>
+        <button type="button" onclick="shadowOnce()">算一拍</button>
+        <button type="button" id="shadow-run" onclick="shadowRun(true)">开始对照</button>
+        <button type="button" onclick="shadowRun(false)">暂停对照</button>
+        <button type="button" onclick="shadowClear()">清除参考</button>
+      </div>
+      <div class="hint" id="shadow-message">Shadow 只显示，不发给手臂。先记下接近成功时的右腕画面，再对照。</div>
+    </div>
     <h3>右腕关节原点实时位姿（Torso_Link）</h3>
     <table>
       <tbody>
@@ -1539,10 +1669,28 @@ function clearSequence(){
   renderSequence();
   saveSequence();
 }
+function trajectoryNameValue(){
+  return document.getElementById('trajectoryName')?.value||'';
+}
+let trajectoryNameTimer=0;
+function queueTrajectoryName(name){
+  clearTimeout(trajectoryNameTimer);
+  trajectoryNameTimer=setTimeout(()=>setTrajectoryName(name), 200);
+}
+async function setTrajectoryName(name){
+  const enabled=!!document.getElementById('trajectoryToggle')?.checked;
+  await fetch('/trajectories/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled, name})});
+}
 async function setTrajectoryRecord(enabled){
   const label=document.getElementById('trajectoryRecordLabel');
   if(label) label.textContent=enabled?'轨迹开':'轨迹关';
-  await fetch('/trajectories/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+  await fetch('/trajectories/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled, name:trajectoryNameValue()})});
+  refresh();
+}
+async function setScreenProgress(enabled){
+  const label=document.getElementById('screenProgressLabel');
+  if(label) label.textContent=enabled?'读取屏幕判断进度：开':'读取屏幕判断进度：关';
+  await fetch('/screen_progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
   refresh();
 }
 async function setRecord(enabled){
@@ -1592,6 +1740,7 @@ async function submitEyeBias(ev){
   }
 }
 async function send(command, btn){
+  if(command==='start'||command==='start_sequence') await setTrajectoryName(trajectoryNameValue());
   if(btn){ btn.classList.add('active'); setTimeout(()=>btn.classList.remove('active'),180); }
   await fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command})});
   refresh();
@@ -1722,6 +1871,44 @@ async function deleteAllTrajectories(){
   refresh();
 }
 function num(v, d=3){ return (v===null||v===undefined||Number.isNaN(v)) ? '—' : Number(v).toFixed(d); }
+function shadowCell(id, value){
+  const node=document.getElementById(id);
+  if(node) node.textContent = value==null ? '—' : Number(value).toFixed(2);
+}
+function renderShadow(shadow){
+  const actual=shadow.actual_step_mm||[null,null,null];
+  const vit=shadow.shadow_step_mm||[null,null,null];
+  const delta=shadow.delta_step_mm||[null,null,null];
+  ['x','y','z'].forEach((axis,index)=>{
+    shadowCell('shadow-actual-'+axis, actual[index]);
+    shadowCell('shadow-vit-'+axis, vit[index]);
+    shadowCell('shadow-delta-'+axis, delta[index]);
+  });
+  const matches=document.getElementById('shadow-matches');
+  if(matches){
+    const similarity=shadow.mean_similarity==null?'—':Number(shadow.mean_similarity).toFixed(3);
+    matches.textContent=`${shadow.matches??0} 对，相似度 ${similarity}，${shadow.extractor||'—'}`;
+  }
+  const rotation=document.getElementById('shadow-rotation');
+  if(rotation) rotation.textContent=`${shadow.recommended_rotation_deg??0}°，未执行`;
+  const state=document.getElementById('shadow-state');
+  if(state) state.textContent=shadow.enabled?'对照中 · 未接入控制':'未接入控制';
+  const message=document.getElementById('shadow-message');
+  if(message) message.textContent=shadow.message||'Shadow 只显示，不发给手臂。';
+  const run=document.getElementById('shadow-run');
+  if(run) run.classList.toggle('active', !!shadow.enabled);
+}
+async function shadowPost(url, body){
+  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  const data=await res.json().catch(()=>({}));
+  const message=document.getElementById('shadow-message');
+  if(!res.ok && message) message.textContent=data.error||'shadow 请求失败';
+  refresh();
+}
+function shadowReference(){ return shadowPost('/shadow/reference'); }
+function shadowClear(){ return shadowPost('/shadow/clear'); }
+function shadowOnce(){ return shadowPost('/shadow/once'); }
+function shadowRun(enabled){ return shadowPost('/shadow/run',{enabled}); }
 async function refresh(){
   try{
     const s = await fetch('/state',{cache:'no-store'}).then(r=>r.json());
@@ -1760,7 +1947,7 @@ async function refresh(){
       `ibvs:${s.arm&&s.arm.ibvs_enabled?'on':'off'}`,
       `stage:${(s.arm&&s.arm.control_stage)||'IDLE'}`,
       `mode:${s.arm?.servo_mode==='direct_pbvs'?'PBVS-DIRECT':(s.arm?.servo_mode==='hybrid'?'HYBRID-VS':(s.arm?.servo_mode==='direct_ee'?'DIRECT-EE':'DUAL-IBVS'))}`,
-      `link:${s.arm?.motion_backend==='service'?'service':'arm_sdk'}`,
+      `link:${s.arm?.motion_backend==='service'?'service':(s.arm?.motion_backend==='arm_sdk'?'arm_sdk':'none')}`,
       `gravity:${s.arm&&s.arm.gravity?'on':'off'}`,
       `sdk:${s.arm&&s.arm.sdk_active?'hold':'released'}`,
       `rec:${s.record?.recording?'REC':(s.record?.enabled?'armed':'off')}`,
@@ -1768,6 +1955,7 @@ async function refresh(){
       `seq:${(s.arm?.button_sequence||[]).length}`,
       `eih:${s.arm?.pbvs_source||'-'}`,
       `joints:${s.upper_body?.ok?'ok':'wait'}`,
+      `shadow:${s.shadow?.enabled?'watch':(s.shadow?.reference?'ref':'off')}`,
     ].map(t=>`<span class="pill">${t}</span>`).join('');
     const sequenceStage=s.arm?.sequence_stage||'';
     const detail=(s.arm?.message||ibvs.message||s.message||'');
@@ -1786,6 +1974,7 @@ async function refresh(){
     document.getElementById('ibvs-dxyz').textContent = [ibvs.dx,ibvs.dy,ibvs.dz].map(v=>num(v,4)).join('  ');
     document.getElementById('ibvs-drpy').textContent = [ibvs.droll,ibvs.dpitch,ibvs.dyaw].map(v=>num(v,2)).join('  ');
     document.getElementById('ibvs-handeye').textContent = (ibvs.handeye&&ibvs.handeye.file) ? ibvs.handeye.file : 'missing';
+    renderShadow(s.shadow||{});
     const trajToggle=document.getElementById('trajectoryToggle');
     if(trajToggle && document.activeElement!==trajToggle){
       trajToggle.checked=!!(s.trajectory&&s.trajectory.enabled);
@@ -1806,9 +1995,17 @@ async function refresh(){
       const sequenceStatus=document.getElementById('sequence-status');
       if(sequenceStatus) sequenceStatus.textContent=sequenceStage;
     }
+    const screenToggle=document.getElementById('screenProgressToggle');
+    if(screenToggle && document.activeElement!==screenToggle){
+      screenToggle.checked=!!s.arm?.screen_progress;
+      const screenLabel=document.getElementById('screenProgressLabel');
+      if(screenLabel) screenLabel.textContent=screenToggle.checked?'读取屏幕判断进度：开':'读取屏幕判断进度：关';
+    }
     const screen=s.screen||{};
     const screenImg=document.getElementById('screenShot');
     const screenStatus=document.getElementById('screenStatus');
+    const screenReport=document.getElementById('screenReport');
+    if(screenReport) screenReport.textContent=(s.arm?.screen_history||[]).join('\n');
     if(screen.ready && screenImg){
       const next='/screen/latest.jpg?t='+screen.at;
       if(screenImg.getAttribute('data-at')!==String(screen.at)){
@@ -1816,9 +2013,9 @@ async function refresh(){
         screenImg.hidden=false;
         screenImg.setAttribute('data-at',String(screen.at));
       }
-      if(screenStatus) screenStatus.textContent='ready';
+      if(screenStatus) screenStatus.textContent=screen.report||s.arm?.screen_report||'ready';
     }else if(screenStatus && !screen.ready){
-      screenStatus.textContent='no screen yet';
+      screenStatus.textContent=screen.report||s.arm?.screen_report||'no screen yet';
     }
     const arm=s.arm||{};
     document.getElementById('manual-state').textContent=arm.manual_enabled?'细调已启用':'先点 Pause';
@@ -1846,7 +2043,7 @@ async function refresh(){
     document.getElementById('state').textContent = JSON.stringify({
       target:s.target, cycle:s.cycle, running:s.running, ibvs:s.ibvs, cameras:s.cameras,
       joints_source:s.upper_body?.source, joints_age_s:s.upper_body?.age_s,
-      joints_message:s.upper_body?.message, last_command:s.last_command
+      joints_message:s.upper_body?.message, last_command:s.last_command, shadow:s.shadow
     }, null, 2);
     document.querySelectorAll('button[data-cmd]').forEach(b=>b.classList.remove('active'));
     const tbtn = document.querySelector(`button[data-cmd="${s.target}"]`);
@@ -1863,7 +2060,7 @@ async function refresh(){
     if(s.arm?.sequence_mode==='direct_pbvs') document.querySelector('button[data-cmd="sequence_direct_pbvs"]')?.classList.add('active');
     else document.querySelector('button[data-cmd="sequence_hybrid"]')?.classList.add('active');
     if(s.arm?.motion_backend==='service') document.querySelector('button[data-cmd="backend_service"]')?.classList.add('active');
-    else document.querySelector('button[data-cmd="backend_arm_sdk"]')?.classList.add('active');
+    else if(s.arm?.motion_backend==='arm_sdk') document.querySelector('button[data-cmd="backend_arm_sdk"]')?.classList.add('active');
     const rec=document.getElementById('recordToggle');
     const recLabel=document.getElementById('recordLabel');
     if(rec && document.activeElement!==rec) rec.checked=!!(s.record&&s.record.enabled);
