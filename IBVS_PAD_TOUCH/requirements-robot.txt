@@ -1,0 +1,3 @@
+# Native Ubuntu 22.04 on H2 only. Skip on WSL unless USB is forwarded.
+-r requirements.txt
+pyrealsense2
