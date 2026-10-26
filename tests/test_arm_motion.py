@@ -37,6 +37,7 @@ from ibvs_pad_touch.web.arm_motion import (
     WRIST_VIEW_DEG,
     camera_delta_to_torso,
     direct_pbvs_motion_goal,
+    expand_quintic_knots,
     fuse_pbvs_buttons,
     relax_x_clearance,
     sequence_clear_goal,
@@ -146,6 +147,26 @@ def test_direct_pbvs_streams_cartesian_samples_with_joint_velocity(monkeypatch):
     assert moving
     assert all(abs(value) < 1e-9 for value in written[-1][1].values())
     assert "实测到位" in mover.message
+
+
+def test_multi_knot_playback_follows_the_polyline_without_stopping():
+    knots = [[index * 0.25, 0.1, -0.2, 0.3, 0.0, 0.0, 0.0] for index in range(6)]
+    samples = expand_quintic_knots(knots, 2.0, 0.02)
+    assert samples[0] == knots[0]
+    assert all(abs(left - right) < 1e-12 for left, right in zip(samples[-1], knots[-1]))
+    assert all(samples[index][0] <= samples[index + 1][0] + 1e-12 for index in range(len(samples) - 1))
+    deltas = [samples[index + 1][0] - samples[index][0] for index in range(len(samples) - 1)]
+    positive = [delta for delta in deltas if delta > 1e-9]
+    median = sorted(positive)[len(positive) // 2]
+    assert min(positive) > 0.5 * median
+
+
+def test_two_knot_playback_still_eases_in():
+    knots = [[0.0] * 7, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+    samples = expand_quintic_knots(knots, 2.0, 0.02)
+    deltas = [samples[index + 1][0] - samples[index][0] for index in range(len(samples) - 1)]
+    assert deltas[0] < deltas[len(deltas) // 2] * 0.2
+    assert abs(samples[-1][0] - 1.0) < 1e-9
 
 
 def test_camera_right_is_torso_minus_y():

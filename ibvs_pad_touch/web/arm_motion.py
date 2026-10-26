@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Chest PBVS coarse move, then right-wrist eye-in-hand IBVS for the poke."""
+
 from __future__ import annotations
 
 import math
@@ -12,6 +13,7 @@ from typing import Any, Callable, Optional, Sequence
 from ibvs_pad_touch.config import load_ibvs_config
 from ibvs_pad_touch.servo.interaction import eye_in_hand_close_align_step, eye_in_hand_ibvs_step
 from ibvs_pad_touch.web.screen_read import blocks_differ, format_block, read_panel
+
 
 
 HANDEYE_ROOTS = (
@@ -177,6 +179,7 @@ PBVS_STAGE_TIMEOUT_S = 30.0
 # follows one Cartesian quintic. feedrate 0.3 applies only to the unused
 # Ruckig joint-space branch. Cartesian time uses the raw 80/140 deg/s limits
 # and is at least the yaml move_duration of 2 s.
+# MOTION PARAMETERS are defined in the yaml file, which are used to calculate the motion duration.
 MOTION_FEEDRATE = 0.3
 MOTION_DT_S = 0.02
 MOTION_MIN_SECONDS = 2.0
@@ -198,6 +201,13 @@ MOTION_MAX_ACC_DEG_S2 = (240.0, 240.0, 240.0, 240.0, 450.0, 450.0, 450.0)
 TRAJECTORY_JOINT_INDEX = {
     "waist_yaw_joint": 12,
     "waist_roll_joint": 13,
+# TRAJECTORY_JOINT_INDEX is the index of the joints along the trajectory, which is used to calculate the motion duration.
+# RIGHT_ARM_JOINTS is the joints of the right arm, which is used to calculate the motion duration.
+# MOTION_TRACK_TOL_DEG is the tolerance of the motion tracking, which is used to calculate the motion duration.
+# MOTION_TRACK_WAIT_S is the wait time of the motion tracking, which is used to calculate the motion duration.
+# MOTION_MAX_VEL_DEG_S is the maximum velocity of the motion, which is used to calculate the motion duration.
+# MOTION_MAX_ACC_DEG_S2 is the maximum acceleration of the motion, which is used to calculate the motion duration.
+# TRAJECTORY_JOINT_INDEX is the index of the joints along the trajectory, which is used to calculate the motion duration.
     "waist_pitch_joint": 14,
     "left_shoulder_pitch_joint": 15,
     "left_shoulder_roll_joint": 16,
@@ -510,6 +520,65 @@ def coarse_x_retract(
         return None
     return (max(delta, -float(max_step_m)), 0.0, 0.0)
 
+def minimum_z_approach(
+    error_m: Sequence[float],
+    *,
+    z_tol_m: float = PBVS_Z_TOL_M,
+) -> tuple[float, float, float] | None:
+    """Minimum Z approach."""
+    if len(error_m) != 3:
+        return None
+    try:
+        ez = float(error_m[2])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ez) or ez >= -float(z_tol_m):
+        return None
+    return (0.0, 0.0, max(-float(max_step_m), ez))
+
+def ibvs_lateral_step(
+    error_m: Sequence[float],
+    *,
+    x_tol_m: float = PBVS_FORWARD_YZ_TOL_M,
+    arrive_m: float = PBVS_XY_TOL_M,
+    max_step_m: float = PBVS_MAX_STEP_M,
+) -> tuple[float, float, float] | None:
+    """Step only in torso Y once X is already close and Y is still off."""
+    if len(error_m) != 3:
+        return None
+    try:
+        ex, ey, _ez = (float(value) for value in error_m)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (ex, ey)):
+        return None
+    if abs(ex) > float(x_tol_m) or abs(ey) <= float(arrive_m):
+        return None
+    return (0.0, max(-float(max_step_m), min(float(max_step_m), ey)), 0.0)
+
+class IBVS_HeartBeat:
+    def __init__(self, iface: Interface, telemetry: Telemetry, log: Callable[[str], None]) -> None:
+        self.iface = iface
+        self.telemetry = telemetry
+        self.log = log
+        self.heartbeat_interval_s = 1.0
+        self.last_heartbeat_time = time.time()
+        self.heartbeat_count = 0
+        self.heartbeat_log_interval_s = 10.0
+        self.last_heartbeat_log_time = time.time()
+        self.running = True
+    def run(self) -> None:
+        while True:
+            time.sleep(self.heartbeat_interval_s)
+            self.heartbeat_count += 1
+            if self.heartbeat_count % self.heartbeat_log_interval_s == 0:
+                self.log(f"Heartbeat: {self.heartbeat_count}")
+            if time.time() - self.last_heartbeat_time > self.heartbeat_interval_s:
+                self.log("Heartbeat timeout")
+                break
+    def stop(self) -> None:
+        self.running = False
+
 
 def pbvs_lateral_step(
     error_m: Sequence[float],
@@ -640,7 +709,9 @@ def sequence_lift_goal(button: Sequence[float]) -> tuple[float, float, float]:
     """September 30 path: no side retreat between presses."""
     return (float(button[0]), float(button[1]), float(button[2]))
 
-
+def load_yolo_models() -> None:
+    """Load the YOLO models."""
+    pass
 # Torso +Y is left and +Z is up, so clearing the faceplate is -Y and -Z.
 SEQUENCE_CLEAR_RIGHT_M = 0.12
 SEQUENCE_CLEAR_DOWN_M = 0.10
@@ -861,17 +932,26 @@ def expand_quintic_knots(
     total_s: float,
     dt: float,
 ) -> list[list[float]]:
-    """50 Hz joint samples through Cartesian IK knots. One quintic per segment."""
+    """50 Hz samples along the solved joint polyline.
+
+    The knots already sit on one Cartesian quintic, and each one was accepted
+    by IK. Walking each gap at constant joint speed follows that quintic and
+    keeps every sample between two accepted knots. A quintic inside every gap
+    stops the arm at each knot. A single two-knot segment still eases in and
+    out, because it has no interior knot to carry the slow start.
+    """
     if not knots:
         return []
     if len(knots) == 1:
         return [[float(value) for value in knots[0]]]
     intervals = len(knots) - 1
     steps = max(1, int(round(max(float(total_s), dt) / intervals / dt)))
+    single_segment = intervals == 1
     samples: list[list[float]] = []
     for start, end in zip(knots, knots[1:]):
         for step in range(steps):
-            blend = quintic_blend(step / steps)
+            phase = step / steps
+            blend = quintic_blend(phase) if single_segment else phase
             samples.append(
                 [
                     float(start[index]) * (1.0 - blend) + float(end[index]) * blend
@@ -1002,6 +1082,13 @@ def camera_delta_to_torso(
         )
     return (float(dz), -float(dx), -float(dy))
 
+def quintic_blend(phase: float) -> float:
+    phase = min(1.0, max(0.0, float(phase)))
+    return 10.0 * phase**3 - 15.0 * phase**4 + 6.0 * phase**5
+
+def logger_info(message: str) -> None:
+    message = f"ArmMover: {message}" 
+    print(message)
 
 class ArmMover:
     def __init__(
@@ -1976,7 +2063,7 @@ class ArmMover:
         if not ok or jump > math.radians(10.0):
             self.message = f"细调 IK 拒绝 pos={pos_err*1000:.1f}mm rot={math.degrees(ori_err):.1f}deg"
             return {"ok": False, "error": self.message}
-        self.controller.apply_arm_rad("right", q_new, seconds=0.35, dt=0.02)
+        self._play_joint_target(q_new, 0.35)
         self.phase = "manual"
         self.message = (
             "细调 "
@@ -2019,7 +2106,7 @@ class ArmMover:
         q_new[joint] = min(high, max(low, q_new[joint] + math.radians(delta)))
         if abs(q_new[joint] - float(commanded[joint])) < 1e-5:
             return {"ok": False, "error": f"{label}已到限位"}
-        self.controller.apply_arm_rad("right", q_new, seconds=0.35, dt=0.02)
+        self._play_joint_target(q_new, 0.35)
         joint_deg = math.degrees(q_new[joint])
         self.phase = "manual"
         self.message = f"{label} {joint_deg:.1f}°"
@@ -4239,12 +4326,7 @@ class ArmMover:
             self._direct_ee_orient_steps += 1
         else:
             self._direct_ee_approach_steps += 1
-        self.controller.apply_arm_rad(
-            "right",
-            q_new,
-            seconds=5.0 if (aligning or orienting) else 3.0,
-            dt=0.02,
-        )
+        self._play_joint_target(q_new, 5.0 if (aligning or orienting) else 3.0)
         measured_after = self.controller.measured_arm_rad("right")
         actual_after = tuple(
             float(value) for value in tip_xyz(measured_after, RIGHT_EE_OFFSET_WRIST_M)
@@ -5578,6 +5660,38 @@ class ArmMover:
                 final[joint] = float(value)
             self.controller.write(final, weight=1.0)
 
+    def _play_joint_target(self, target_rad: Sequence[float], seconds: float) -> None:
+        """One solved joint segment. Quintic timing, with dq, when the SDK can stream.
+
+        The line between the held joints and this IK solution is unchanged.
+        apply_arm_rad leaves dq at 0, so kd brakes the whole ramp.
+        """
+        target = [float(value) for value in target_rad]
+        writer = getattr(self.controller, "write", None)
+        hold_fn = getattr(self.controller, "hold_positions", None)
+        if callable(writer) and callable(hold_fn) and len(target) >= 7:
+            hold = hold_fn()
+            try:
+                start = [float(hold[joint]) for joint in RIGHT_ARM_JOINTS]
+            except (KeyError, TypeError):
+                start = []
+            if len(start) == 7:
+                self._use_motion_gains()
+                steps = max(1, int(round(max(float(seconds), MOTION_DT_S) / MOTION_DT_S)))
+                samples = []
+                for step in range(steps):
+                    blend = quintic_blend(step / steps)
+                    samples.append(
+                        [
+                            start[index] * (1.0 - blend) + target[index] * blend
+                            for index in range(7)
+                        ]
+                    )
+                samples.append(target[:7])
+                self._stream_arm_samples(samples)
+                return
+        self.controller.apply_arm_rad("right", target, seconds=seconds, dt=MOTION_DT_S)
+
     def _play_cartesian_samples(self, samples: Sequence[Sequence[float]]) -> float:
         """Stream one Cartesian IK sequence. Tests without write() receive only the final pose."""
         self._use_motion_gains()
@@ -5673,7 +5787,7 @@ class ArmMover:
             )
             return False
         shoulder_raised = float(q_new[0]) < float(q[0]) - math.radians(0.4)
-        self.controller.apply_arm_rad("right", q_new, seconds=seconds, dt=0.02)
+        self._play_joint_target(q_new, seconds)
         self.phase = phase
         if phase != "POKE":
             self.message = (
@@ -5689,7 +5803,7 @@ class ArmMover:
             return False
         try:
             self.log("[ARM] 视觉丢失：退回上一可见姿态")
-            self.controller.apply_arm_rad("right", q, seconds=0.8, dt=0.02)
+            self._play_joint_target(q, 0.8)
             return True
         except Exception as exc:
             self.log(f"[ARM][WARN] 回退失败，保持当前姿态: {exc}")
