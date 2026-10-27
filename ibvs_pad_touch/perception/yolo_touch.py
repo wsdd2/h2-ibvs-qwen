@@ -6,6 +6,7 @@ only when that rectangle is missing, and only if the point is confident and insi
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,10 +59,13 @@ class YoloTouchDetector:
         seg_weights: str | Path = SEG_WEIGHTS,
         pose_weights: str | Path = POSE_WEIGHTS,
         imgsz: int = 640,
+        name: str = "",
     ) -> None:
+        self.name = str(name or "")
         self.seg_weights = Path(seg_weights)
         self.pose_weights = Path(pose_weights)
         self.imgsz = int(imgsz)
+        self._infer_lock = threading.Lock()
         self._seg = None
         self._pose = None
         self._ready = False
@@ -77,16 +81,17 @@ class YoloTouchDetector:
         return "idle"
 
     def predict(self, bgr: np.ndarray) -> YoloTouch | None:
-        if not self._ensure():
-            return None
-        seg = self._seg.predict(bgr, imgsz=self.imgsz, conf=0.15, verbose=False)[0]
-        pose = self._pose.predict(bgr, imgsz=self.imgsz, conf=0.15, verbose=False)[0]
-        return YoloTouch(
-            panel_corners=_panel_quad(seg),
-            panel_conf=_panel_conf(seg),
-            points=_pose_points(pose),
-            masks=_seg_masks(seg),
-        )
+        with self._infer_lock:
+            if not self._ensure():
+                return None
+            seg = self._seg.predict(bgr, imgsz=self.imgsz, conf=0.15, verbose=False)[0]
+            pose = self._pose.predict(bgr, imgsz=self.imgsz, conf=0.15, verbose=False)[0]
+            return YoloTouch(
+                panel_corners=_panel_quad(seg),
+                panel_conf=_panel_conf(seg),
+                points=_pose_points(pose),
+                masks=_seg_masks(seg),
+            )
 
 
     def _ensure(self) -> bool:
@@ -107,7 +112,8 @@ class YoloTouchDetector:
             self._seg = YOLO(str(self.seg_weights))
             self._pose = YOLO(str(self.pose_weights))
             self._ready = True
-            print(f"[ibvs-yolo] loaded {self.seg_weights} + {self.pose_weights}", flush=True)
+            label = f"{self.name} " if self.name else ""
+            print(f"[ibvs-yolo] {label}loaded {self.seg_weights} + {self.pose_weights}", flush=True)
             return True
         except Exception as exc:
             self._failed = f"yolo unavailable: {exc}"

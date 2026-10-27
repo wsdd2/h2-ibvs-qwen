@@ -736,11 +736,19 @@ class LiveIbvsAnnotator:
         self._last_side_screen = None
         self._side_ready_fn = lambda: False
         self._stage_fn = lambda: ""
-        self.detector = detector if detector is not None else (YoloTouchDetector() if use_yolo else None)
-        if use_yolo and detector is None and self.detector is not None:
+        if detector is not None:
+            self.detector = detector
+            self.wrist_detector = detector
+        elif use_yolo:
+            self.detector = YoloTouchDetector(name="chest")
+            self.wrist_detector = YoloTouchDetector(name="wrist")
             self.detector._ensure()
+            self.wrist_detector._ensure()
+        else:
+            self.detector = None
+            self.wrist_detector = None
         self._touch_cache: dict[str, tuple[float, Any]] = {}
-        self._yolo_warned = False
+        self._yolo_warned: set[str] = set()
         self._side: dict[str, Any] = {
             "measured": False,
             "contact": False,
@@ -1254,19 +1262,20 @@ class LiveIbvsAnnotator:
         """Right-wrist buttons below this are noise. They are not drawn and do not move the arm."""
         return max(WRIST_BUTTON_CONF_MIN, self._point_conf())
 
-    def _touch(self, key: str, bgr: np.ndarray):
-        if self.detector is None:
+    def _touch(self, key: str, bgr: np.ndarray, detector=None):
+        detector = self.detector if detector is None else detector
+        if detector is None:
             return None
         now = time.monotonic()
         cached = self._touch_cache.get(key)
         if cached is not None and now - float(cached[0]) < 0.20:
             return cached[1]
         try:
-            result = self.detector.predict(bgr)
+            result = detector.predict(bgr)
         except Exception as exc:
-            if not self._yolo_warned:
-                print(f"[ibvs-yolo] {exc}", flush=True)
-                self._yolo_warned = True
+            if key not in self._yolo_warned:
+                print(f"[ibvs-yolo] {key} {exc}", flush=True)
+                self._yolo_warned.add(key)
             result = None
         self._touch_cache[key] = (now, result)
         return result
@@ -1688,7 +1697,7 @@ class LiveIbvsAnnotator:
             armed = bool(self._side_ready_fn())
         except Exception:
             armed = False
-        touch = self._touch("side", bgr)
+        touch = self._touch("wrist", bgr, self.wrist_detector)
         vis, seg_corners, tip = self._paint_side(bgr, touch)
         self._note_wrist_pbvs(bgr, touch, tip)
         with self._lock:

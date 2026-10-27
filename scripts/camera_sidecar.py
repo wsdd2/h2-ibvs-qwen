@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -119,6 +120,26 @@ def _write_frame(bgr: np.ndarray, out: Path) -> Path:
     return write_bgr(out, bgr)
 
 
+_RS_IO = threading.Lock()
+
+
+def _grab_frames(pipe):
+    """Non-blocking grab. wait_for_frames from two cameras can sit forever after the first frame."""
+    poll = getattr(pipe, "poll_for_frames", None)
+    if callable(poll):
+        try:
+            with _RS_IO:
+                pack = poll()
+        except TypeError:
+            pack = None
+        else:
+            if pack is not None:
+                return pack
+            return None
+    with _RS_IO:
+        return pipe.wait_for_frames(timeout_ms=200)
+
+
 def _read_frames(
     pipe,
     align,
@@ -134,46 +155,80 @@ def _read_frames(
     """Read until the stream dies. Return False when the first color frame never arrives."""
     frames = 0
     empty = 0
+    depth_misses = 0
     exposure_ready = False
     exposure_locked = False
-    deadline = time.monotonic() + 8.0
+    started = time.monotonic()
+    deadline = started + 8.0
+    last_color = started
+    last_note = started
     while True:
+        now = time.monotonic()
         try:
-            pack = pipe.wait_for_frames(timeout_ms=2000)
+            pack = _grab_frames(pipe)
         except Exception as exc:
             empty += 1
             if frames == 0 and (empty == 1 or empty % 3 == 0):
                 print(f"[ibvs-cam] {args.name} no frame yet: {exc}", flush=True)
-            if frames == 0 and time.monotonic() > deadline:
+            if frames == 0 and now > deadline:
+                return False
+            if frames > 0 and now - last_color > 3.0 and now - last_note > 2.0:
+                print(
+                    f"[ibvs-cam] {args.name} stalled {now - last_color:.1f}s after {frames} frames",
+                    flush=True,
+                )
+                last_note = now
+            time.sleep(0.02)
+            continue
+        if pack is None:
+            if frames == 0 and now > deadline:
+                print(f"[ibvs-cam] {args.name} no frame in 8s", flush=True)
+                return False
+            if frames > 0 and now - last_color > 3.0 and now - last_note > 2.0:
+                print(
+                    f"[ibvs-cam] {args.name} no new frame for {now - last_color:.1f}s after {frames}",
+                    flush=True,
+                )
+                last_note = now
+            time.sleep(0.01)
+            continue
+        try:
+            with _RS_IO:
+                if align is not None:
+                    pack = align.process(pack)
+                color = pack.get_color_frame()
+                depth_frame = None
+                if depth_out is not None and depth_scale is not None:
+                    depth_frame = pack.get_depth_frame()
+                color_data = None if color is None else np.array(color.get_data(), copy=True)
+                depth_data = None if depth_frame is None else np.array(depth_frame.get_data(), copy=True)
+        except Exception as exc:
+            if frames == 0 and now > deadline:
+                print(f"[ibvs-cam] {args.name} align failed: {exc}", flush=True)
                 return False
             continue
-        if align is not None:
-            try:
-                pack = align.process(pack)
-            except Exception as exc:
-                if frames == 0 and time.monotonic() > deadline:
-                    print(f"[ibvs-cam] {args.name} align failed: {exc}", flush=True)
-                    return False
-                continue
-        color = pack.get_color_frame()
-        if color is None:
-            if frames == 0 and time.monotonic() > deadline:
+        if color_data is None:
+            if frames == 0 and now > deadline:
                 print(f"[ibvs-cam] {args.name} color frame missing", flush=True)
                 return False
+            time.sleep(0.01)
             continue
         if depth_out is not None:
-            depth_frame = None if depth_scale is None else pack.get_depth_frame()
-            if depth_frame is None:
-                if frames == 0 and time.monotonic() > deadline:
+            if depth_data is None:
+                depth_misses += 1
+                if frames == 0 and now > deadline:
                     print(f"[ibvs-cam] {args.name} depth frame missing", flush=True)
                     return False
-                continue
-            write_depth(
-                depth_out,
-                np.asanyarray(depth_frame.get_data()),
-                depth_scale,
-            )
-        written = _write_frame(np.asanyarray(color.get_data()), out)
+                if frames > 0 and now - last_note > 2.0:
+                    print(
+                        f"[ibvs-cam] {args.name} depth missing, color kept frames={frames}",
+                        flush=True,
+                    )
+                    last_note = now
+            else:
+                write_depth(depth_out, depth_data, depth_scale)
+        written = _write_frame(color_data, out)
+        last_color = time.monotonic()
         frames += 1
         if frames == 1:
             print(f"[ibvs-cam] {args.name} first frame {written} serial={serial}", flush=True)
@@ -214,33 +269,38 @@ def _read_frames(
             except Exception as exc:
                 exposure_locked = True
                 print(f"[ibvs-cam] {args.name} exposure lock failed: {exc}", flush=True)
+        if time.monotonic() - last_note >= 5.0:
+            print(
+                f"[ibvs-cam] {args.name} live frames={frames} depth_miss={depth_misses}",
+                flush=True,
+            )
+            last_note = time.monotonic()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--serial", default="")
-    parser.add_argument("--out", default="")
-    parser.add_argument("--depth-out", default="")
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, default=15)
-    parser.add_argument(
-        "--lock-exposure-after",
-        type=int,
-        default=45,
-        help="let RGB auto exposure settle N frames, then freeze it; 0 keeps auto",
+def _parse_cam_spec(spec: str) -> argparse.Namespace:
+    """name:serial:color_out:depth_out. Paths contain no extra colons."""
+    name, serial, out, depth = str(spec).split(":", 3)
+    return argparse.Namespace(
+        name=name,
+        serial=serial,
+        out=out,
+        depth_out=depth,
+        width=640,
+        height=480,
+        fps=15,
+        lock_exposure_after=0,
+        manual_exposure=0.0,
+        manual_gain=-1.0,
     )
-    parser.add_argument("--manual-exposure", type=float, default=0.0)
-    parser.add_argument("--manual-gain", type=float, default=-1.0)
-    args = parser.parse_args()
+
+
+def serve_camera(rs, args) -> None:
     out = Path(args.out or f"/tmp/ibvs_cam_{args.name}.jpg")
     depth_out = Path(args.depth_out) if args.depth_out else None
-    rs = usable_realsense()
-    if rs is None:
-        print(f"[ibvs-cam] {args.name} no rs.pipeline in {sys.executable}", flush=True)
-        sys.exit(2)
-    print(f"[ibvs-cam] {args.name} prefer={args.serial or '-'} py={sys.executable} bind={getattr(rs, '__file__', '')}", flush=True)
+    print(
+        f"[ibvs-cam] {args.name} prefer={args.serial or '-'} py={sys.executable} bind={getattr(rs, '__file__', '')}",
+        flush=True,
+    )
     while True:
         devices = list_realsense(rs)
         write_seen(devices)
@@ -318,6 +378,58 @@ def main() -> None:
             )
             time.sleep(0.5)
         time.sleep(1.0)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--name", default="")
+    parser.add_argument("--serial", default="")
+    parser.add_argument("--out", default="")
+    parser.add_argument("--depth-out", default="")
+    parser.add_argument(
+        "--dual",
+        action="store_true",
+        help="open every --cam in this process so the second RealSense stays visible",
+    )
+    parser.add_argument(
+        "--cam",
+        action="append",
+        default=[],
+        help="name:serial:color_out:depth_out, repeat for each camera when --dual",
+    )
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument(
+        "--lock-exposure-after",
+        type=int,
+        default=45,
+        help="let RGB auto exposure settle N frames, then freeze it; 0 keeps auto",
+    )
+    parser.add_argument("--manual-exposure", type=float, default=0.0)
+    parser.add_argument("--manual-gain", type=float, default=-1.0)
+    args = parser.parse_args()
+    rs = usable_realsense()
+    if rs is None:
+        print(f"[ibvs-cam] no rs.pipeline in {sys.executable}", flush=True)
+        sys.exit(2)
+    if args.dual:
+        if len(args.cam) < 2:
+            parser.error("--dual needs at least two --cam name:serial:out:depth")
+        cameras = [_parse_cam_spec(spec) for spec in args.cam]
+        threads = [
+            threading.Thread(target=serve_camera, args=(rs, cam), name=f"cam-{cam.name}", daemon=True)
+            for cam in cameras
+        ]
+        for thread in threads:
+            thread.start()
+            time.sleep(0.8)
+        for thread in threads:
+            thread.join()
+        return
+    if not args.name:
+        parser.error("--name is required unless --dual is set")
+    serve_camera(rs, args)
 
 
 if __name__ == "__main__":

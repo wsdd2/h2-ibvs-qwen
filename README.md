@@ -1,125 +1,185 @@
 # IBVS_PAD_TOUCH
 
-宇树 H2 右臂 + 闭合 Dex1-1 + **胸部 D435i**。面板固定，相机固定。本仓库先在图像里定位整块面板，再用比例尺把 Button 1/2/3 投到画面上（黄色质心只做修正）。有指尖观测之后，才输出指尖到按钮的相机系 `dx, dy, dz`。不控夹爪、不控上身、不走 ROS、**不做手眼标定**。
+宇树 H2 空调面板视觉点按系统。当前主流程使用：
 
-## 正确顺序
+- 胸口 Intel RealSense D435（序列号 `347622074029`）做 Eye-to-Hand 粗定位；
+- 右腕 Intel RealSense D435I（序列号 `233722073797`）做 Eye-in-Hand 精对准、进近和接触确认；
+- 右臂与 Dex1 完成实际点按；
+- 左手 BrainCo Revo2 提供独立的手指姿态控制，目前不参与面板点按。
 
-1. **定位整块面板**（四角 / 米色壳体）
-2. **比例尺为主**：把尺量模型通过 Homography 投到当前图像，得到 Button 1/2/3
-3. **视觉为辅**：只在预测框里用黄条质心微调，不靠颜色认“这是几号键”
-4. **再研究指尖**：同一相机里看到闭合 Dex1 尖端后，`delta = P_button − P_tip`（相机系）
-5. **先左右 / 上下对准开关**：只执行相机 `dx, dy`，深度不动
-6. **再把深度顶到开关面板**：开关对准后才执行相机 `dz`，目标是黄键所在面板，不是后面的墙
-7. 当前阶段的增量直接给运控当笛卡尔增量
+系统已接入 H2 实机运动，不再是只显示检测结果的监视页面。运行前必须确认 H2 处于稳定站立状态，人员位于手臂工作空间之外。
 
-胸部相机是眼在手外。手臂移动时，**按钮在画面里几乎不动**，被伺服的是指尖去就按钮，不是把按钮“吸”到画面某个固定像素。
+## 工作流程
 
-## 为什么不用手眼标定
+1. 胸口相机通过 YOLO 分割、姿态关键点、深度和 Eye-to-Hand 标定获取按钮的躯干坐标。
+2. 胸口 PBVS 将右腕移动到目标按钮附近，并保留进近净空。
+3. 控制切换到右腕相机；Eye-in-Hand 视觉把按钮与工具尖端对齐。
+4. 右腕相机监测最后进近和接触，避免盲目向墙面推进。
+5. 组合模式按顺序点按多个按钮；可选读取屏幕图像判断按键是否生效并重试。
 
-这里不做 PBVS：不重建面板在机器人基座下的位姿，也不算 `T_base_cam * P_button`。
+H2 躯干坐标约定为 `+X` 向前、`+Y` 向左、`+Z` 向上。RealSense 光学坐标为 `X` 向右、`Y` 向下、`Z` 向前，代码通过标定矩阵完成转换。
 
-每周期只告诉运控：**当前相机画面里，指尖还差按钮多少米**。约定胸部 D435i 的轴就是运控笛卡尔轴：
+## 视觉模型与标定
 
-- X 右
-- Y 下
-- Z 光轴向前（靠近面板为正）
+YOLO 权重默认位于：
 
-这是安装轴向约定，不是 Tsai 手眼。相机若明显俯仰/滚转，只允许以后做一次固定轴置换，仍不在本仓库做手眼标定。
-
-## 按钮
-
-| 名称 | 面板键 | 说明 |
-|---|---|---|
-| Button 1 | `<` | 右上组合黄键左半 |
-| Button 2 | `>` | 同一颗键右半 |
-| Button 3 | OK | 正下方 |
-
-面板 **300 × 130 mm**。Button 1/2 中心 `(238.75, 30)` / `(256.25, 30)` mm，Button 3 `(247.50, 50)` mm。
-
-## 阶段
-
-| 阶段 | 输出 | 现状 |
-|---|---|---|
-| 匹配面板 | `SEEK_PANEL` / `LOCALIZED`，不动 | 先认整块面板和三颗键 |
-| 左右 / 上下 | `ALIGN_XY`，只有相机 `dx, dy` | 先对准开关，不进深 |
-| 深度 | `APPROACH_Z`，只有相机 `dz` | 对准后再顶到开关面板，不到墙 |
-| 到位 | `HOLD` | 指尖停在黄键上 |
-| 运控 | 按同一组轴执行增量 | Isaac 已接；实机未接 |
-
-实机胸部相机暂时看不到指尖时，`--no-tip` / 默认实机路径只做定位，不会假装已经在戳。
-
-## 实机网页监视（sim2real 第一步）
-
-H2 是 **Ubuntu 22.04**。SSH 上车后用 bash 启动 Flask；本机浏览器再打开车上的地址。  
-`unitree@192.168.1.3`，胸口相机序列号 `347622074029`。**Button 1 / 2 / 3 / Cycle / Start / Stop / Reset 已预留，这一步不发 `arm_sdk`。**
-
-```bash
-ssh unitree@192.168.1.3
-cd ~/IBVS_PAD_TOUCH
-chmod +x scripts/*.sh
-./scripts/start_web_remote.sh 8080
+```text
+outputs/runs/yolo12_seg_20261014_1045/weights/best.pt
+outputs/runs/yolo26s_pose_20261014_1045/weights/best.pt
 ```
 
-日志打在这个 SSH 窗口里，**Ctrl+C** 同时停掉网页和关节sidecar。不要在 WSL 里跑这条（`~/IBVS_PAD_TOUCH` 会变成 `/home/wsdd2/...`）。
+胸口和右腕各自加载一套 YOLO-seg 与 YOLO-pose 实例，避免两个相机线程并发使用同一个 Ultralytics 模型。启动日志应分别出现：
 
-然后在你自己的电脑浏览器打开：
-
+```text
+[ibvs-yolo] chest loaded ...
+[ibvs-yolo] wrist loaded ...
 ```
-http://192.168.1.3:8080/
-```
 
-## 运行
+胸口相机使用 Eye-to-Hand 标定；右腕相机使用 Eye-in-Hand 标定。不要用现场偏置替代错误的标定文件，也不要放宽最终工具尖端与目标按钮的安全门槛。
 
-开发机默认是 **WSL2 Ubuntu**；上车是 **H2 原生 Ubuntu 22.04**。两边都不依赖 X11：OpenCV 用 headless，结果写 `outputs/`。
+## 部署到 H2
 
-### WSL2（本机）
+推荐从 WSL 同步：
 
 ```bash
 cd /mnt/e/MscapeTech/IBVS_PAD_TOUCH
-chmod +x scripts/*.sh
-./scripts/setup_ubuntu.sh
-./scripts/run_ibvs.sh --source synthetic --target button_1 --no-tip
-./scripts/run_ibvs.sh --source synthetic --target button_1
-```
-
-指定解释器（和 `mt_act_panel` 一样会优先 `~/miniconda3/envs/rmb`）：
-
-```bash
-export IBVS_PYTHON="$HOME/miniconda3/envs/rmb/bin/python"
-```
-
-WSL 里 RealSense USB 转发不稳定，本机只跑合成 / 静态图。`--show` 没有 `DISPLAY` 时会自动改成只写图。
-
-Windows 里也能直接：
-
-```powershell
-cd E:\MscapeTech\IBVS_PAD_TOUCH
-pip install -r requirements.txt
-python -m pytest tests -q
-python scripts\run_ibvs.py --smoke
-python scripts\annotate_photos.py
-```
-
-实拍标注图在 `outputs/annotate/`。白墙上先找高饱和黄键：最上条左右对半是 Button 1/2，下一条是 Button 3。
-
-### 上传到 H2（Ubuntu 22.04）
-
-```bash
 export IBVS_ROBOT_HOST=unitree@192.168.1.3
 export IBVS_ROBOT_DIR=IBVS_PAD_TOUCH
 ./scripts/sync_to_robot.sh
 ```
 
-不要写未加引号的 `~/IBVS_PAD_TOUCH`：会在本机 WSL 用户下展开成 `/home/你的用户名/...`，新车上没有这个目录。路径相对车上 `unitree` 的家目录。新机器会先 `mkdir` 再传。
+`IBVS_ROBOT_DIR` 是相对 H2 用户家目录的路径。不要把本地展开后的 `~/IBVS_PAD_TOUCH` 当成远端路径。
 
-车上：
+同步不会自动重启正在运行的网页。行为或页面代码更新后，需要在 H2 上结束旧进程并重新启动。
+
+## 启动实机网页
+
+在 H2 本体上：
 
 ```bash
 cd ~/IBVS_PAD_TOUCH
 chmod +x scripts/*.sh
-./scripts/setup_ubuntu.sh --robot          # 可选再加 --apt
-# 当前用户要能读 D435i：sudo usermod -aG video $USER
-./scripts/run_ibvs.sh --source realsense --target button_1
+./scripts/start_web_remote.sh 8080 \
+  --direct-pbvs-poke \
+  --direct-pbvs-max-m 1.20 \
+  --direct-pbvs-max-joint-deg 120 \
+  --eye-to-hand-x-bias-m 0.05 \
+  --eye-to-hand-y-bias-m -0.01 \
+  --eye-to-hand-z-bias-m 0.025
 ```
 
-`--robot` 会尝试 `pip install pyrealsense2`。H2 上如果已经有宇树 / librealsense 环境，用 `IBVS_PYTHON` 指过去即可，不必再装一份。
+浏览器打开：
+
+```text
+http://192.168.1.3:8080/
+```
+
+启动脚本会：
+
+- 在同一个相机 sidecar 进程中打开胸口和右腕 RealSense，绕开同一 USB Hub 下两个独立 librealsense 进程互相抢占的问题；
+- 启动关节状态 sidecar；
+- 启动 Flask 网页和视觉推理；
+- 保留 `arm_sdk` 与 `h2_arm_service_node` 两种运动链路，但不会同时占用 `rt/arm_sdk`。
+
+前台运行时按 `Ctrl+C` 会先放下右臂再退出，通常需要约 8 秒。不要在右臂下降过程中重复发送中断。
+
+## 网页操作
+
+推荐顺序：
+
+1. 检查两路画面、深度和 YOLO 状态。
+2. 点击 `arm_sdk`，等待页面显示控制链路已拉起。
+3. 选择 Button 1、Button 2 或 Button 3。
+4. 选择 `Hybrid VS`，然后点击 `Start`；连续点按使用“组合启动”。
+5. 需要人工细调时先点 `Pause / 细调`。已停止的任务不会自行恢复，需要重新启动。
+6. `释放双臂` 释放控制；`Reset`、`下垂` 和退出程序会改变手臂姿态，操作前清空工作区。
+
+“读取屏幕判断进度”默认关闭。打开后，组合和单次运行会在点按前后抓取屏幕；若屏幕没有变化，该按钮最多重试三次。
+
+页面还提供截图、数据集保存、会话记录、运动轨迹记录/回放和 Eye-to-Hand 现场偏置显示。轨迹回放前必须确认记录来源、环境和起始姿态一致。
+
+## 左手 BrainCo Revo2
+
+网页提供三个只作用于左手的按钮：
+
+- `左手食指`：食指伸直，其余手指收紧，命令为 `(1, 1, 0, 1, 1, 1)`；
+- `左手张开`：六通道均为 `0`；
+- `左手停止`：停止持续发送左手命令。
+
+话题为：
+
+```text
+rt/brainco/left/cmd
+rt/brainco/left/state
+```
+
+需要先运行 Unitree `brainco_hand_service`。左手控制不会发布右手 BrainCo 话题；H2 右手仍是 Dex1。独立保持食指姿态也可运行：
+
+```bash
+python3 scripts/revo2_left_index.py
+```
+
+如果没有收到 `rt/brainco/left/state`，程序不会发送动作，并提示检查手部服务、`eth0` 和 RS485 连接。
+
+## 相机与深度状态
+
+正常日志每约 5 秒出现：
+
+```text
+[ibvs-cam] chest live frames=... depth_miss=0
+[ibvs-cam] d435i live frames=... depth_miss=0
+```
+
+仅出现首帧并不代表流仍在更新，应确认 `frames` 持续增加。深度文件超过 2 秒未更新时，网页会显示 depth unavailable。
+
+## 常见问题
+
+### 页面一直显示 loading
+
+确认浏览器持续请求 `/state`，并检查浏览器控制台是否有 JavaScript 语法错误。MJPEG 请求是长连接，服务器通常要等客户端断开后才打印该请求日志。
+
+### arm_sdk 一直等待
+
+确认 H2 正在发布 `rt/lowstate`，且没有遗留的 `h2_arm_service_node` 占用运动话题。网页的 `arm_sdk` 按钮会在后台建立连接，HTTP 请求本身不应长时间阻塞。
+
+### 右腕没有检测结果
+
+先确认右腕 `live frames` 持续增加，再检查日志是否有独立的 `wrist loaded`。画面正常但显示 `SEG unavailable` 或 `POSE unavailable` 时，查看同名 `[ibvs-yolo] wrist ...` 异常。
+
+### CPU 占用看起来超过 100%
+
+Linux `top` 按单核计数，`660%` 表示约使用 6.6 个 CPU 核。双路 YOLO-seg 与 YOLO-pose 默认在 CPU 上推理时占用较高；应同时观察整机 idle、负载和推理延迟。
+
+## 本地开发
+
+Windows：
+
+```powershell
+cd E:\MscapeTech\IBVS_PAD_TOUCH
+pip install -r requirements.txt
+python scripts\run_ibvs.py --smoke
+python scripts\annotate_photos.py
+```
+
+WSL：
+
+```bash
+cd /mnt/e/MscapeTech/IBVS_PAD_TOUCH
+chmod +x scripts/*.sh
+./scripts/setup_ubuntu.sh
+./scripts/run_ibvs.sh --source synthetic --target button_1
+```
+
+WSL 的 RealSense USB 转发可能不稳定，本地开发优先使用合成或静态图。实拍标注输出位于 `outputs/annotate/`，会话、轨迹和数据集分别写入 `outputs/recordings/`、`outputs/trajectories/` 和 `outputs/dataset/`。
+
+## 目录
+
+```text
+ibvs_pad_touch/camera/       图像、深度与 RealSense 工具
+ibvs_pad_touch/perception/   面板、按钮、工具尖端和 YOLO 推理
+ibvs_pad_touch/web/          网页、视觉融合、运动控制和 Revo2 控制
+scripts/                     启动、同步、sidecar、标注与诊断脚本
+configs/                     相机、面板、IBVS 和机器人配置
+outputs/                     权重、标定、记录、轨迹与数据集
+tests/                       单元和接口测试
+```

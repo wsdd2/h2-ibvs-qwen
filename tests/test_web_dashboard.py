@@ -273,6 +273,10 @@ def test_flask_page_has_reserved_buttons_and_state():
     assert "Direct PBVS" in html
     assert "Hybrid VS" in html
     assert "backend_arm_sdk" in html
+    assert "left_index" in html
+    assert "左手食指" in html
+    assert "左手张开" in html
+    assert "左手停止" in html
     assert "backend_service" in html
     assert "only after Release" in html
     assert 'data-cmd="hang"' in html
@@ -325,6 +329,18 @@ def test_flask_page_has_reserved_buttons_and_state():
     assert bad_delete.status_code == 400
     assert bad_delete.get_json()["ok"] is False
     idle = client.get("/state").get_json()
+    assert idle["revo2_left"]["side"] == "left"
+    assert idle["revo2_left"]["holding"] is False
+    dash.revo2.point_index = lambda: "左手食指伸出，其余收紧"
+    dash.revo2.open_hand = lambda: "左手张开"
+    dash.revo2.stop = lambda: "已停止发送左手 Revo2"
+    left = client.post("/command", json={"command": "left_index"}).get_json()
+    assert left["ok"]
+    assert "食指" in (left["state"]["message"] or "")
+    opened = client.post("/command", json={"command": "left_open"}).get_json()
+    assert "张开" in (opened["state"]["message"] or "")
+    stopped = client.post("/command", json={"command": "left_stop"}).get_json()
+    assert "停止" in (stopped["state"]["message"] or "")
     assert idle["record"]["enabled"] is False
     assert idle["record"]["recording"] is False
     armed = client.post("/record", json={"enabled": True}).get_json()
@@ -405,15 +421,14 @@ def test_sequence_route_and_trajectory_switch():
     client = dash.app.test_client()
     state = client.get("/state").get_json()
     assert state["trajectory"]["enabled"] is False
-    assert state["arm"]["motion_backend"] == ""
+    assert state["arm"]["motion_backend"] == "arm_sdk"
     assert state["arm"]["screen_progress"] is False
     assert state["screen"]["ready"] is False
     assert state["screen"]["progress"] is False
     blocked = client.post("/command", json={"command": "start"}).get_json()
-    assert "请先点" in (blocked["state"]["message"] or "")
-    enabled = client.post("/trajectories/enabled", json={"enabled": True, "name": "按钮1 poke"}).get_json()
+    assert "confirm-arm-motion" in (blocked["state"]["message"] or "")
+    enabled = client.post("/trajectories/enabled", json={"enabled": True}).get_json()
     assert enabled["trajectory"]["enabled"] is True
-    assert enabled["trajectory"]["name"] == "按钮1_poke"
     posted = client.post(
         "/sequence",
         json={"steps": ["button_1", "button_2", "button_1", "button_3", "button_9"]},

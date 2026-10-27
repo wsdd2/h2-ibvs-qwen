@@ -1156,6 +1156,7 @@ class ArmMover:
         self._stop_service_node = None
         self._start_service_node = None
         self._start_arm_sdk = None
+        self._arm_sdk_thread: Optional[threading.Thread] = None
         self._drop_arm_sdk = None
         self._service_node_cached: tuple[float, bool] | None = None
         self._thread: Optional[threading.Thread] = None
@@ -1435,32 +1436,6 @@ class ArmMover:
             self.log(f"[ARM] 启动运控服务失败: {exc}")
             return False
 
-    def _call_start_arm_sdk(self) -> bool:
-        """Enable this page's arm_sdk publisher. A test hook replaces the real connect."""
-        fn = self._start_arm_sdk
-        if fn is not None:
-            try:
-                ok = bool(fn())
-            except Exception as exc:
-                self.message = f"arm_sdk 没有起来: {exc}"
-                return False
-            if not ok:
-                self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
-            return ok
-        if self._sdk_holding():
-            return True
-        try:
-            self._connect()
-        except Exception as exc:
-            self._drop_failed_sdk()
-            self.message = f"arm_sdk 没有起来: {exc}"
-            self.log(f"[ARM] {self.message}")
-            return False
-        if self.controller is None:
-            self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
-            return False
-        return True
-
     @staticmethod
     def _normalize_backend(backend: str, default: str = "") -> str:
         chosen = str(backend or "").strip().lower().replace("-", "_")
@@ -1486,16 +1461,47 @@ class ArmMover:
         return ""
 
     def _refuse_conflict(self, publisher: str | None = None) -> str:
-        if self._motion_backend not in {"arm_sdk", "service"}:
-            self.message = "请先点 arm_sdk 或 Service，再操作手臂。"
-            self.log(f"[ARM] {self.message}")
-            return self.message
-        which = publisher or self._motion_backend
+        which = publisher or ("service" if self._motion_backend == "service" else "arm_sdk")
         message = self.publisher_conflict(which)
         if message:
             self.message = message
             self.log(f"[ARM][WARN] {message}")
         return message
+
+    def _arm_sdk_bringup(self) -> None:
+        """Stop a competing service node, then connect. Runs off the web request."""
+        try:
+            if self._service_node_up():
+                stopped = self._call_stop_service_node()
+                self._service_node_cached = None
+                if not stopped or self._service_node_up():
+                    self._motion_backend = "service"
+                    self.message = (
+                        "冲突：停不掉 h2_arm_service_node，它仍占用 rt/arm_sdk。"
+                        "已拒绝，仍是运控服务。"
+                    )
+                    self.log(f"[ARM][WARN] {self.message}")
+                    return
+            fn = self._start_arm_sdk
+            if fn is not None:
+                ok = bool(fn())
+                if not ok:
+                    self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
+                    self.log(f"[ARM][WARN] {self.message}")
+                    return
+            else:
+                self._connect()
+            if fn is None and self.controller is None:
+                self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
+                self.log(f"[ARM][WARN] {self.message}")
+                return
+            self._motion_backend = "arm_sdk"
+            self.message = "已拉起 arm_sdk。控制链路：arm_sdk。"
+            self.log(f"[ARM] {self.message}")
+        except Exception as exc:
+            self._drop_failed_sdk()
+            self.message = f"arm_sdk 没有起来: {exc}"
+            self.log(f"[ARM][WARN] {self.message}")
 
     def set_motion_backend(self, backend: str) -> str:
         """Pick arm_sdk or the arm service. Idle pages can switch; a running move cannot."""
@@ -1519,9 +1525,9 @@ class ArmMover:
             return self.message
         node_up = self._service_node_up()
         if (
-            chosen == self._motion_backend == "arm_sdk"
-            and not node_up
+            chosen == "arm_sdk"
             and self._sdk_holding()
+            and not node_up
         ):
             self.message = "控制链路已是 arm_sdk"
             return self.message
@@ -1535,39 +1541,30 @@ class ArmMover:
         self._drop_page_holder(quiet=node_up and self._sdk_holding())
         self._service_node_cached = None
         if chosen == "arm_sdk":
-            stopped_service = False
-            if self._service_node_up():
-                stopped = self._call_stop_service_node()
-                self._service_node_cached = None
-                if not stopped or self._service_node_up():
-                    self._motion_backend = "service"
-                    self.message = (
-                        "冲突：停不掉 h2_arm_service_node，它仍占用 rt/arm_sdk。"
-                        "已拒绝，仍是运控服务。"
-                    )
-                    self.log(f"[ARM][WARN] {self.message}")
-                    return self.message
-                stopped_service = True
-            self._motion_backend = "arm_sdk"
-            if not self._call_start_arm_sdk():
-                self._motion_backend = ""
-                if not self.message:
-                    self.message = "arm_sdk 没有起来。请再点一次 arm_sdk。"
-                self.log(f"[ARM][WARN] {self.message}")
+            worker = self._arm_sdk_thread
+            if worker is not None and worker.is_alive():
+                self._motion_backend = "arm_sdk"
+                self.message = "正在拉起 arm_sdk"
                 return self.message
-            if stopped_service:
-                self.message = "已停止运控服务，并拉起 arm_sdk。控制链路：arm_sdk。"
-            else:
-                self.message = "已拉起 arm_sdk。控制链路：arm_sdk。"
+            self._motion_backend = "arm_sdk"
+            self.message = "正在拉起 arm_sdk"
+            self.log(f"[ARM] {self.message}")
+            self._arm_sdk_thread = threading.Thread(
+                target=self._arm_sdk_bringup,
+                name="arm-sdk-start",
+                daemon=True,
+            )
+            self._arm_sdk_thread.start()
+            return self.message
         else:
             if not self._service_node_up():
                 self._call_start_service_node()
                 self._service_node_cached = None
             self._motion_backend = "service"
             if self._service_node_up():
-                self.message = "已拉起 h2_arm_service_node。控制链路：运控服务。本页不发 arm_sdk。"
+                self.message = "控制链路：运控服务。下次 Raise/Start 调用 h2_arm_service，本页不发 arm_sdk。"
             else:
-                self.message = "控制链路：运控服务。h2_arm_service_node 没有起来，请再点一次 Service。"
+                self.message = "控制链路：运控服务。h2_arm_service_node 没有起来，Start 前请确认节点。"
         self.log(f"[ARM] {self.message}")
         return self.message
 

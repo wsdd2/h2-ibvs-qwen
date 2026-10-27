@@ -251,6 +251,36 @@ launch_camera_sidecar() {
   esac
 }
 
+launch_camera_pair() {
+  local wrap=()
+  if [ "${1:-}" = "--nohup" ]; then
+    wrap=(nohup)
+    shift
+  fi
+  local py_args=(--dual)
+  local spec
+  for spec in "$@"; do
+    py_args+=(--cam "$spec")
+  done
+  case "${IBVS_CAM_LD_LIBRARY_PATH:-clean}" in
+    inherit)
+      "${wrap[@]}" env \
+        PYTHONPATH="${IBVS_CAM_PYTHONPATH}" PYTHONUNBUFFERED=1 \
+        "$CAM_PY" "$ROOT/scripts/camera_sidecar.py" "${py_args[@]}"
+      ;;
+    clean|"")
+      "${wrap[@]}" env -u LD_LIBRARY_PATH \
+        PYTHONPATH="${IBVS_CAM_PYTHONPATH}" PYTHONUNBUFFERED=1 \
+        "$CAM_PY" "$ROOT/scripts/camera_sidecar.py" "${py_args[@]}"
+      ;;
+    *)
+      "${wrap[@]}" env LD_LIBRARY_PATH="${IBVS_CAM_LD_LIBRARY_PATH}" \
+        PYTHONPATH="${IBVS_CAM_PYTHONPATH}" PYTHONUNBUFFERED=1 \
+        "$CAM_PY" "$ROOT/scripts/camera_sidecar.py" "${py_args[@]}"
+      ;;
+  esac
+}
+
 start_camera_sidecars() {
   if [ -z "${CAM_PY:-}" ]; then
     echo "[ibvs] WARN: cameras not started; no pyrealsense2 survived query_devices" >&2
@@ -263,14 +293,14 @@ start_camera_sidecars() {
     *) echo "[ibvs] camera LD_LIBRARY_PATH=${IBVS_CAM_LD_LIBRARY_PATH}" ;;
   esac
   clear_camera_files
-  launch_camera_sidecar chest 347622074029 /tmp/ibvs_cam_chest.jpg /tmp/ibvs_depth_chest.bin \
-    > >(sed -u 's/^/[cam-chest] /') 2>&1 &
+  # One process opens both cameras. A second process sees usb=(none)
+  # after the first pipeline.start() on this USB hub.
+  launch_camera_pair \
+    "chest:347622074029:/tmp/ibvs_cam_chest.jpg:/tmp/ibvs_depth_chest.bin" \
+    "d435i:233722073797:/tmp/ibvs_cam_d435i.jpg:/tmp/ibvs_depth_d435i.bin" \
+    > >(sed -u 's/^/[cam] /') 2>&1 &
   CAM_PIDS+=("$!")
   echo $! > /tmp/ibvs_cam_chest.pid
-  sleep 2
-  launch_camera_sidecar d435i 233722073797 /tmp/ibvs_cam_d435i.jpg /tmp/ibvs_depth_d435i.bin \
-    > >(sed -u 's/^/[cam-d435i] /') 2>&1 &
-  CAM_PIDS+=("$!")
   echo $! > /tmp/ibvs_cam_d435i.pid
 }
 
@@ -298,12 +328,11 @@ if [ "$DETACH" -eq 1 ]; then
   echo $! > /tmp/ibvs_joints.pid
   if [ -n "${CAM_PY:-}" ]; then
     clear_camera_files
-    launch_camera_sidecar --nohup chest 347622074029 /tmp/ibvs_cam_chest.jpg /tmp/ibvs_depth_chest.bin \
+    launch_camera_pair --nohup \
+      "chest:347622074029:/tmp/ibvs_cam_chest.jpg:/tmp/ibvs_depth_chest.bin" \
+      "d435i:233722073797:/tmp/ibvs_cam_d435i.jpg:/tmp/ibvs_depth_d435i.bin" \
       > /tmp/ibvs_cam_chest.log 2>&1 &
     echo $! > /tmp/ibvs_cam_chest.pid
-    sleep 2
-    launch_camera_sidecar --nohup d435i 233722073797 /tmp/ibvs_cam_d435i.jpg /tmp/ibvs_depth_d435i.bin \
-      > /tmp/ibvs_cam_d435i.log 2>&1 &
     echo $! > /tmp/ibvs_cam_d435i.pid
   fi
   PYTHONPATH="${IBVS_WEB_PYTHONPATH}" nohup "$PY" "$ROOT/scripts/run_web.py" --host 0.0.0.0 --port "${PORT}" --confirm-arm-motion "${EXTRA[@]}" \
