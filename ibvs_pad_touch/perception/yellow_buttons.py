@@ -146,6 +146,29 @@ def match_yellow_blob(
     return nearest[0]
 
 
+def nearest_long_yellow_bar(
+    bgr: np.ndarray,
+    tip_uv: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    """Center of the long yellow key closest to the fingertip.
+
+    Oriented bars stay valid when the wrist camera is rolled. Axis-aligned
+    bars cover the same keys when the view is level.
+    """
+    if tip_uv is None:
+        return None
+    tu, tv = float(tip_uv[0]), float(tip_uv[1])
+    oriented = detect_oriented_yellow_bars(bgr)
+    if oriented:
+        best = min(oriented, key=lambda bar: math.hypot(bar.cx - tu, bar.cy - tv))
+        return float(best.cx), float(best.cy)
+    bars = detect_yellow_bars(bgr)
+    if not bars:
+        return None
+    best_bar = min(bars, key=lambda bar: math.hypot(bar.cx - tu, bar.cy - tv))
+    return float(best_bar.cx), float(best_bar.cy)
+
+
 def detect_yellow_bars(bgr: np.ndarray) -> list[YellowBar]:
     mask = yellow_mask(bgr)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

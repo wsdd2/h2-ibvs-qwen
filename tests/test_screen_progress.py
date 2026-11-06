@@ -102,7 +102,7 @@ def _mover(calls, frames):
     mover.set_button_sequence(["button_1", "button_2"])
 
     def direct(telem, release=True):
-        calls.append(("direct", telem["target"], release))
+        calls.append(("direct", telem["target"], release, mover.status()["message"]))
         mover.phase = "direct_pbvs_complete"
 
     def hybrid(name, goal):
@@ -118,13 +118,16 @@ def test_screen_progress_repeats_a_press_until_the_panel_changes():
     frames = [_half(True), _half(True), _half(False), _half(True)]
     mover = _mover(calls, frames)
     mover._run_button_sequence()
-    pressed = [item for item in calls if item[0] == "direct"]
+    pressed = [item[:3] for item in calls if item[0] == "direct"]
     assert pressed == [
         ("direct", "button_1", False),
         ("direct", "button_1", False),
         ("direct", "button_2", False),
     ]
-    assert any("重新执行" in line for line in mover.status()["screen_history"])
+    notes = [item[3] for item in calls if item[0] == "direct"]
+    assert "【重试】" not in notes[0]
+    assert "【重试】第1次" in notes[1]
+    assert any("【重试】第1次" in line for line in mover.status()["screen_history"])
     assert any("按到了" in line and "Button1" in line for line in mover.status()["screen_history"])
     assert any("按到了" in line and "Button2" in line for line in mover.status()["screen_history"])
     assert mover.phase == "released"
@@ -141,6 +144,7 @@ def test_screen_progress_stops_when_the_panel_never_changes():
     assert ("release", 1.2) not in calls
     assert ("ramp", REST_DEG) not in calls
     assert any("屏幕仍无变化" in line for line in mover.status()["screen_history"])
+    assert any("【重试】第2次后仍失败" in line for line in mover.status()["screen_history"])
     assert mover._control_stage == "HOLD"
 
 

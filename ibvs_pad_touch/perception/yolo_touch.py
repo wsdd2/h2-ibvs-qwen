@@ -7,6 +7,7 @@ only when that rectangle is missing, and only if the point is confident and insi
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,13 +17,18 @@ import numpy as np
 from ibvs_pad_touch.perception.features import sample_depth
 from ibvs_pad_touch.perception.gripper_tip import point_inside_panel
 from ibvs_pad_touch.perception.localizer import order_corners
+from ibvs_pad_touch.platform import gpu_name, prepare_torch_gpu
 from ibvs_pad_touch.types import CameraPoint, Intrinsics, Localization
 
 ROOT = Path(__file__).resolve().parents[2]
 SEG_WEIGHTS = ROOT / "outputs" / "runs" / "yolo12_seg_20261014_1045" / "weights" / "best.pt"
-POSE_WEIGHTS = ROOT / "outputs" / "runs" / "yolo26s_pose_20261014_1045" / "weights" / "best.pt"
-KPT_NAMES = ("gripper_tip", "button_1", "button_2", "button_3")
+POSE_WEIGHTS = ROOT / "outputs" / "runs" / "yolo26s_pose_20261103_1130" / "weights" / "best.pt"
+KPT_NAMES = ("gripper_tip", "button_1", "button_2", "button_3", "FingerTip")
 BUTTON_NAMES = ("button_1", "button_2", "button_3")
+# Chest and wrist each run seg + pose. Two forwards at a time keep the Orin GPU busy
+# without stacking four networks on one frame.
+_GPU_SLOTS = threading.BoundedSemaphore(2)
+_USE_QUANTIZE: bool | None = None
 
 
 @dataclass
@@ -51,6 +57,39 @@ class YoloTouch:
         return self.points.get(name)
 
 
+def normalize_button_layout(touch: YoloTouch | None) -> YoloTouch | None:
+    """Button 3 is the OK key below Button 1. Swap a pose pair that violates that."""
+    if touch is None:
+        return None
+    upper = touch.point("button_1")
+    lower = touch.point("button_3")
+    if upper is None or lower is None:
+        return touch
+    if float(upper.v) <= float(lower.v) + 8.0:
+        return touch
+    points = dict(touch.points)
+    points["button_1"] = YoloPoint("button_1", lower.u, lower.v, lower.conf)
+    points["button_3"] = YoloPoint("button_3", upper.u, upper.v, upper.conf)
+    return YoloTouch(
+        panel_corners=touch.panel_corners,
+        panel_conf=touch.panel_conf,
+        points=points,
+        masks=list(touch.masks),
+    )
+
+
+def without_gripper(touch: YoloTouch | None) -> YoloTouch | None:
+    """Drop the Dex1 jaw and gripper_tip. FingerTip, panel, screen, and buttons stay."""
+    if touch is None:
+        return None
+    return YoloTouch(
+        panel_corners=touch.panel_corners,
+        panel_conf=touch.panel_conf,
+        points={name: point for name, point in touch.points.items() if name != "gripper_tip"},
+        masks=[mask for mask in touch.masks if mask.name != "gripper"],
+    )
+
+
 class YoloTouchDetector:
     """Lazy ultralytics models. Missing weights or import leaves detection classical."""
 
@@ -60,45 +99,175 @@ class YoloTouchDetector:
         pose_weights: str | Path = POSE_WEIGHTS,
         imgsz: int = 640,
         name: str = "",
+        cpu_pose: bool = False,
     ) -> None:
         self.name = str(name or "")
         self.seg_weights = Path(seg_weights)
         self.pose_weights = Path(pose_weights)
         self.imgsz = int(imgsz)
+        self._cpu_pose = bool(cpu_pose)
         self._infer_lock = threading.Lock()
+        self._cpu_lock = threading.Lock()
+        self._load_lock = threading.Lock()
+        self._wrist_waiting = False
         self._seg = None
         self._pose = None
+        self._device = "cpu"
+        self._half = False
         self._ready = False
         self._failed = ""
+        self._precision_key: str | None = None
 
     def status(self) -> str:
         if self._failed:
             return self._failed
         if self._ready:
-            return "yolo"
-        if not self.seg_weights.is_file() or not self.pose_weights.is_file():
+            precision = "fp16" if self._half else "fp32"
+            return f"yolo {self._device} {precision}"
+        pose_only = self._cpu_pose and self.pose_weights.is_file()
+        if self._cpu_pose and not self.pose_weights.is_file():
+            return "weights missing"
+        if not pose_only and (not self.seg_weights.is_file() or not self.pose_weights.is_file()):
             return "weights missing"
         return "idle"
 
-    def predict(self, bgr: np.ndarray) -> YoloTouch | None:
-        with self._infer_lock:
+    def predict(self, bgr: np.ndarray, *, pose_only: bool = False) -> YoloTouch | None:
+        if self._cpu_pose:
+            return self._predict_cpu_pose(bgr)
+        with self._load_lock:
             if not self._ensure():
                 return None
-            seg = self._seg.predict(bgr, imgsz=self.imgsz, conf=0.15, verbose=False)[0]
-            pose = self._pose.predict(bgr, imgsz=self.imgsz, conf=0.15, verbose=False)[0]
+        image = np.ascontiguousarray(bgr)
+        if pose_only:
+            # Chest seg+pose used to hold the GPU for the whole pair, so the
+            # wrist fingertip only updated after both of those finished.
+            self._wrist_waiting = True
+            try:
+                pose = self._forward(self._pose, image, polite=False)
+            finally:
+                self._wrist_waiting = False
             return YoloTouch(
-                panel_corners=_panel_quad(seg),
-                panel_conf=_panel_conf(seg),
+                panel_corners=None,
+                panel_conf=0.0,
                 points=_pose_points(pose),
-                masks=_seg_masks(seg),
+                masks=[],
             )
+        seg = self._forward(self._seg, image, polite=True)
+        pose = self._forward(self._pose, image, polite=True)
+        return YoloTouch(
+            panel_corners=_panel_quad(seg),
+            panel_conf=_panel_conf(seg),
+            points=_pose_points(pose),
+            masks=_seg_masks(seg),
+        )
 
+    def _predict_cpu_pose(self, bgr: np.ndarray) -> YoloTouch | None:
+        """Right-wrist pose. A second model on CPU, so the chest GPU run is not moved."""
+        with self._load_lock:
+            if not self._ensure():
+                return None
+        image = np.ascontiguousarray(bgr)
+        with self._cpu_lock:
+            pose = self._predict(self._pose, image, device="cpu", half=False)
+        return YoloTouch(
+            panel_corners=None,
+            panel_conf=0.0,
+            points=_pose_points(pose),
+            masks=[],
+        )
+
+    def _forward_pair(self, image: np.ndarray):
+        """One GPU. Two Ultralytics predicts at once queue behind each other and run slower than one after the other."""
+        seg = self._forward(self._seg, image, polite=False)
+        pose = self._forward(self._pose, image, polite=False)
+        return seg, pose
+
+    def _forward(self, model, image: np.ndarray, *, polite: bool = False):
+        deadline = time.monotonic() + 0.4
+        while True:
+            if polite and self._wrist_waiting and time.monotonic() < deadline:
+                time.sleep(0.005)
+                continue
+            with self._infer_lock:
+                if polite and self._wrist_waiting and time.monotonic() < deadline:
+                    continue
+                with _GPU_SLOTS:
+                    return self._predict(model, image)
+
+    def _predict(self, model, image: np.ndarray, *, device: str | None = None, half: bool | None = None):
+        use_device = self._device if device is None else device
+        use_half = self._half if half is None else half
+        kwargs = {
+            "imgsz": self.imgsz,
+            "conf": 0.15,
+            "device": use_device,
+            "verbose": False,
+        }
+        if use_half:
+            kwargs.update(self._precision_kwargs())
+        try:
+            return model.predict(image, **kwargs)[0]
+        except TypeError as exc:
+            if "quantize" not in kwargs or "quantize" not in str(exc):
+                raise
+            self._precision_key = "half"
+            kwargs.pop("quantize", None)
+            kwargs["half"] = True
+            return model.predict(image, **kwargs)[0]
+        except RuntimeError as exc:
+            text = str(exc).lower()
+            if not self._half or not any(token in text for token in ("half", "float16", "fp16", "quantize")):
+                raise
+            self._half = False
+            self._precision_key = None
+            kwargs.pop("half", None)
+            kwargs.pop("quantize", None)
+            print(f"[ibvs-yolo] FP16 不可用，改用 FP32: {exc}", flush=True)
+            return model.predict(image, **kwargs)[0]
+
+    def _precision_kwargs(self) -> dict:
+        """FP16 on CUDA. New Ultralytics calls this quantize=16; half= warns every frame."""
+        if not self._half:
+            return {}
+        if self._precision_key is None:
+            self._precision_key = "quantize" if _ultralytics_uses_quantize() else "half"
+        if self._precision_key == "quantize":
+            return {"quantize": 16}
+        return {"half": True}
+
+    def _ensure_cpu_pose(self) -> bool:
+        if not self.pose_weights.is_file():
+            self._failed = "weights missing"
+            print(f"[ibvs-yolo] weights missing pose={self.pose_weights}", flush=True)
+            return False
+        try:
+            from ultralytics import YOLO
+
+            _silence_half_deprecation()
+            self._device = "cpu"
+            self._half = False
+            self._pose = YOLO(str(self.pose_weights))
+            blank = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            self._predict(self._pose, blank, device="cpu", half=False)
+            self._ready = True
+            label = f"{self.name} " if self.name else ""
+            print(
+                f"[ibvs-yolo] {label}loaded cpu fp32 {self.pose_weights.name}",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            self._failed = f"yolo unavailable: {exc}"
+            print(f"[ibvs-yolo] {self._failed}", flush=True)
+            return False
 
     def _ensure(self) -> bool:
         if self._ready:
             return True
         if self._failed:
             return False
+        if self._cpu_pose:
+            return self._ensure_cpu_pose()
         if not self.seg_weights.is_file() or not self.pose_weights.is_file():
             self._failed = "weights missing"
             print(
@@ -109,16 +278,70 @@ class YoloTouchDetector:
         try:
             from ultralytics import YOLO
 
+            _silence_half_deprecation()
+            self._device = prepare_torch_gpu()
+            self._half = self._device.startswith("cuda")
             self._seg = YOLO(str(self.seg_weights))
             self._pose = YOLO(str(self.pose_weights))
+            blank = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            try:
+                self._forward_pair(blank)
+            except Exception as exc:
+                if not self._device.startswith("cuda"):
+                    raise
+                print(f"[ibvs-yolo] GPU 预热失败，改用 CPU: {exc}", flush=True)
+                self._device = "cpu"
+                self._half = False
+                self._forward_pair(blank)
             self._ready = True
             label = f"{self.name} " if self.name else ""
-            print(f"[ibvs-yolo] {label}loaded {self.seg_weights} + {self.pose_weights}", flush=True)
+            where = self._device if self._device == "cpu" else f"{self._device} {gpu_name()}"
+            precision = "fp16" if self._half else "fp32"
+            print(
+                f"[ibvs-yolo] {label}loaded {where} {precision} "
+                f"{self.seg_weights.name} + {self.pose_weights.name}",
+                flush=True,
+            )
             return True
         except Exception as exc:
             self._failed = f"yolo unavailable: {exc}"
             print(f"[ibvs-yolo] {self._failed}", flush=True)
             return False
+
+
+def _silence_half_deprecation() -> None:
+    """Ultralytics prints this on every predict(). FP16 itself stays enabled."""
+    import logging
+
+    class _Filter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "'half' is deprecated" not in record.getMessage()
+
+    logger = logging.getLogger("ultralytics")
+    if not any(isinstance(item, _Filter) for item in logger.filters):
+        logger.addFilter(_Filter())
+
+
+def _ultralytics_uses_quantize() -> bool:
+    """predict(half=True) warns on Ultralytics 8.4.90+. quantize=16 is the same FP16."""
+    global _USE_QUANTIZE
+    if _USE_QUANTIZE is not None:
+        return _USE_QUANTIZE
+    try:
+        import ultralytics
+
+        parts: list[int] = []
+        for piece in str(ultralytics.__version__).split("."):
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            if not digits:
+                break
+            parts.append(int(digits))
+        while len(parts) < 3:
+            parts.append(0)
+        _USE_QUANTIZE = tuple(parts[:3]) >= (8, 4, 90)
+    except Exception:
+        _USE_QUANTIZE = False
+    return _USE_QUANTIZE
 
 
 def panel_is_regular_rectangle(corners, aspect_min: float = 1.55, aspect_max: float = 8.0) -> bool:
@@ -245,12 +468,26 @@ def _regular_pose_triplet_ok(
 
 
 def pose_tip(touch: YoloTouch | None, conf_min: float) -> CameraPoint | None:
+    return _pose_keypoint(touch, "gripper_tip", conf_min, "pose")
+
+
+def pose_finger_tip(touch: YoloTouch | None, conf_min: float) -> CameraPoint | None:
+    """Revo2 index fingertip. This replaces gripper_tip in the wrist approach."""
+    return _pose_keypoint(touch, "FingerTip", conf_min, "finger")
+
+
+def _pose_keypoint(
+    touch: YoloTouch | None,
+    name: str,
+    conf_min: float,
+    source: str,
+) -> CameraPoint | None:
     if touch is None:
         return None
-    pt = touch.point("gripper_tip")
+    pt = touch.point(name)
     if pt is None or float(pt.conf) < float(conf_min):
         return None
-    return CameraPoint(u=pt.u, v=pt.v, source="pose", confidence=float(pt.conf))
+    return CameraPoint(u=pt.u, v=pt.v, source=source, confidence=float(pt.conf))
 
 
 def _class_name(result, index: int) -> str:
@@ -423,21 +660,24 @@ def _seg_masks(result) -> list[YoloMask]:
 
 
 def _pose_points(result) -> dict[str, YoloPoint]:
+    """Keep the best keypoint of each name across every detected person.
+
+    The wrist view often contains the feet as well as the hand. Keeping only
+    the highest box drops a lower-scoring FingerTip.
+    """
     kpts = getattr(result, "keypoints", None)
-    boxes = getattr(result, "boxes", None)
     if kpts is None or kpts.data is None or len(kpts.data) == 0:
         return {}
-    data = kpts.data
-    pick = 0
-    if boxes is not None and boxes.conf is not None and len(boxes.conf) == len(data):
-        pick = int(np.argmax(boxes.conf.detach().cpu().numpy()))
-    row = data[pick].detach().cpu().numpy()
+    data = kpts.data.detach().cpu().numpy()
     found: dict[str, YoloPoint] = {}
-    for i, name in enumerate(KPT_NAMES):
-        if i >= row.shape[0]:
-            break
-        u, v, conf = (float(row[i, 0]), float(row[i, 1]), float(row[i, 2]))
-        if conf <= 0.0:
-            continue
-        found[name] = YoloPoint(name=name, u=u, v=v, conf=conf)
+    for row in data:
+        for i, name in enumerate(KPT_NAMES):
+            if i >= row.shape[0]:
+                break
+            u, v, conf = (float(row[i, 0]), float(row[i, 1]), float(row[i, 2]))
+            if conf <= 0.0:
+                continue
+            current = found.get(name)
+            if current is None or conf > current.conf:
+                found[name] = YoloPoint(name=name, u=u, v=v, conf=conf)
     return found

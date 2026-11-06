@@ -19,6 +19,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--records-port",
+        type=int,
+        default=8082,
+        help="客户记录页端口，默认 8082。0 表示不打开。",
+    )
     parser.add_argument("--serial", default="", help="D435i serial; default is configs/camera_d435i.yaml")
     parser.add_argument("--iface", default="eth0", help="Unitree DDS NIC, e.g. eth0")
     parser.add_argument("--jpeg-quality", type=int, default=80)
@@ -106,6 +112,17 @@ def main() -> None:
         default=20.0,
         help="已不使用。一次到位按运控 right_ee 位姿求解，关节变化上限 120deg。",
     )
+    parser.add_argument(
+        "--right-ee",
+        choices=("dex1", "revo2"),
+        default="dex1",
+        help="右手点按末端。dex1 保持原夹爪；revo2 用食指指尖并拉起右手 Revo2。",
+    )
+    parser.add_argument(
+        "--revo2-bridge",
+        default="",
+        help="右手串口在机器人 PC2 上时填写，例如 192.168.123.162:8091。Orin 只发送目标姿势。",
+    )
     args = parser.parse_args()
     dash = RealRobotDashboard(
         host=args.host,
@@ -131,6 +148,9 @@ def main() -> None:
         pbvs_step_m=args.pbvs_step_m,
         pbvs_step_seconds=args.pbvs_step_seconds,
         pbvs_max_joint_deg=args.pbvs_max_joint_deg,
+        right_ee=args.right_ee,
+        records_port=args.records_port,
+        revo2_bridge=args.revo2_bridge,
     )
 
     interrupting = False

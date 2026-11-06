@@ -1,6 +1,20 @@
+import time
+
 import numpy as np
 
-from ibvs_pad_touch.perception.yolo_touch import YoloMask, YoloPoint, YoloTouch, apply_pose_buttons, pose_button_ok
+from ibvs_pad_touch.perception.yolo_touch import (
+    YoloMask,
+    YoloPoint,
+    YoloTouch,
+    YoloTouchDetector,
+    apply_pose_buttons,
+    _pose_points,
+    normalize_button_layout,
+    pose_button_ok,
+    pose_finger_tip,
+    pose_tip,
+    without_gripper,
+)
 from ibvs_pad_touch.types import CameraPoint, Localization
 from ibvs_pad_touch.web.live_ibvs import LiveIbvsAnnotator
 
@@ -37,11 +51,11 @@ def test_gripper_without_a_pose_tip_uses_the_narrow_end_of_the_long_axis():
     assert 180.0 < tip.u < 220.0
 
 
-def test_side_view_draws_the_axis_tip_when_pose_is_missing():
+def test_side_view_does_not_invent_a_tip_from_a_seg_mask():
     from ibvs_pad_touch.perception.yolo_touch import YoloMask, YoloTouch
 
     class _JawOnly:
-        def predict(self, bgr):
+        def predict(self, bgr, **_kwargs):
             return YoloTouch(
                 masks=[
                     YoloMask(
@@ -57,7 +71,7 @@ def test_side_view_draws_the_axis_tip_when_pose_is_missing():
     out = annotator.annotate("d435i", frame)
     assert annotator.telemetry()["side_measured"] is False
     assert annotator.telemetry()["left_contact"] is False
-    assert int(out[36:48, 410:430, 1].max()) > 250
+    assert int(out[180, 420].max()) == 240
 
 
 def test_low_confidence_gripper_and_a_tip_off_the_jaw_are_dropped():
@@ -272,3 +286,159 @@ def test_chest_preview_uses_pose_tip_and_pose_button():
     assert telem["tip_source"] == "pose"
     assert telem["tip_raw_uv"] == [180.0, 220.0]
     assert telem["target_uv"] == [230.0, 160.0]
+
+
+def test_revo2_mode_drops_gripper_and_gripper_tip():
+    touch = YoloTouch(
+        points={
+            "gripper_tip": YoloPoint("gripper_tip", 10.0, 20.0, 0.9),
+            "button_1": YoloPoint("button_1", 30.0, 40.0, 0.8),
+        },
+        masks=[
+            YoloMask("gripper", 0.95, [(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)]),
+            YoloMask("panel", 0.7, [(0.0, 0.0), (8.0, 0.0), (0.0, 8.0)]),
+            YoloMask("screen", 0.6, [(1.0, 1.0), (3.0, 1.0), (1.0, 3.0)]),
+        ],
+    )
+    kept = without_gripper(touch)
+    assert kept is not None
+    assert "gripper_tip" not in kept.points
+    assert "button_1" in kept.points
+    assert [mask.name for mask in kept.masks] == ["panel", "screen"]
+    finger = YoloTouch(
+        points={
+            "gripper_tip": YoloPoint("gripper_tip", 10.0, 20.0, 0.9),
+            "FingerTip": YoloPoint("FingerTip", 40.0, 50.0, 0.85),
+            "button_1": YoloPoint("button_1", 30.0, 40.0, 0.8),
+        }
+    )
+    kept_finger = without_gripper(finger)
+    found = pose_finger_tip(kept_finger, 0.3)
+    assert found is not None
+    assert found.source == "finger"
+    assert (found.u, found.v) == (40.0, 50.0)
+    assert pose_tip(kept_finger, 0.3) is None
+
+
+def test_pose_keeps_the_fingertip_from_a_lower_scoring_box():
+    class _Tensor:
+        def __init__(self, value):
+            self.value = np.asarray(value, dtype=np.float32)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+        def __len__(self):
+            return len(self.value)
+
+    class _Keypoints:
+        def __init__(self, value):
+            self.data = _Tensor(value)
+
+    class _Result:
+        def __init__(self, value):
+            self.keypoints = _Keypoints(value)
+            self.boxes = None
+
+    # Higher box has no fingertip. The hand is the second box.
+    rows = np.zeros((2, 5, 3), dtype=np.float32)
+    rows[0, 0] = (10.0, 10.0, 0.9)
+    rows[1, 4] = (200.0, 180.0, 0.4)
+    found = _pose_points(_Result(rows))
+    assert abs(found["gripper_tip"].conf - 0.9) < 1e-5
+    assert (found["FingerTip"].u, found["FingerTip"].v) == (200.0, 180.0)
+
+
+def test_button3_above_button1_is_swapped_back():
+    swapped = normalize_button_layout(
+        YoloTouch(
+            points={
+                "button_1": YoloPoint("button_1", 100.0, 220.0, 0.9),
+                "button_3": YoloPoint("button_3", 110.0, 140.0, 0.8),
+            }
+        )
+    )
+    assert swapped is not None
+    assert (swapped.point("button_1").u, swapped.point("button_1").v) == (110.0, 140.0)
+    assert (swapped.point("button_3").u, swapped.point("button_3").v) == (100.0, 220.0)
+    kept = normalize_button_layout(
+        YoloTouch(
+            points={
+                "button_1": YoloPoint("button_1", 100.0, 140.0, 0.9),
+                "button_3": YoloPoint("button_3", 110.0, 220.0, 0.8),
+            }
+        )
+    )
+    assert (kept.point("button_1").v, kept.point("button_3").v) == (140.0, 220.0)
+
+
+def test_seg_and_pose_run_at_the_same_time():
+    class _Empty:
+        boxes = None
+        masks = None
+        keypoints = None
+
+    log = []
+
+    class _Model:
+        def __init__(self, name):
+            self.name = name
+
+        def predict(self, image, **kwargs):
+            assert kwargs["device"] == "cpu"
+            log.append(("start", self.name))
+            time.sleep(0.12)
+            log.append(("end", self.name))
+            return [_Empty()]
+
+    detector = YoloTouchDetector(name="chest")
+    detector._ready = True
+    detector._device = "cpu"
+    detector._half = False
+    detector._seg = _Model("seg")
+    detector._pose = _Model("pose")
+    touch = detector.predict(np.zeros((32, 32, 3), dtype=np.uint8))
+    assert touch is not None
+    assert [(item[0], item[1]) for item in log] == [
+        ("start", "seg"),
+        ("end", "seg"),
+        ("start", "pose"),
+        ("end", "pose"),
+    ]
+    log.clear()
+    pose_only = detector.predict(np.zeros((32, 32, 3), dtype=np.uint8), pose_only=True)
+    assert pose_only is not None
+    assert pose_only.masks == []
+    assert pose_only.panel_corners is None
+    assert [(item[0], item[1]) for item in log] == [("start", "pose"), ("end", "pose")]
+
+
+def test_wrist_pose_uses_its_own_cpu_model():
+    class _Empty:
+        boxes = None
+        masks = None
+        keypoints = None
+
+    log = []
+
+    class _Model:
+        def predict(self, image, **kwargs):
+            log.append(kwargs["device"])
+            return [_Empty()]
+
+    detector = YoloTouchDetector(name="wrist", cpu_pose=True)
+    detector._ready = True
+    detector._device = "cpu"
+    detector._half = False
+    detector._pose = _Model()
+    detector._seg = _Model()
+    touch = detector.predict(np.zeros((32, 32, 3), dtype=np.uint8))
+    assert touch is not None
+    assert touch.masks == []
+    assert log == ["cpu"]

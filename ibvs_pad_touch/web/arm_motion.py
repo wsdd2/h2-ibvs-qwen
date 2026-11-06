@@ -79,6 +79,11 @@ PBVS_XY_TOL_M = 0.01
 # plane. 0.3 cm in front of the PBVS button; the coarse goal may neither
 # cross it nor land on it. The wrist approach still closes the last gap.
 COARSE_X_CLEARANCE_M = 0.003
+# While Y or Z is still off, the fingertip stays at least this far short in X.
+# X closes only after YZ is aligned, or after that YZ move cannot be solved.
+# Off: that held-X pose folds the elbow backward. The button pose is used instead.
+PBVS_YZ_FIRST = False
+PBVS_YZ_X_CLEAR_M = 0.02
 # Solver wrist error can look small while the fingertip is still far below
 # the button. A 17 cm Z miss must not be played.
 PBVS_TIP_MATCH_M = 0.02
@@ -121,8 +126,13 @@ RIGHT_ARM_JOINT_LIMITS_RAD = (
 RIGHT_ELBOW_INDEX = 3
 RIGHT_ELBOW_LIMIT_RAD = RIGHT_ARM_JOINT_LIMITS_RAD[RIGHT_ELBOW_INDEX]
 DIRECT_EE_RPY_DEG = (-88.8133, -3.98969, 3.20691)
-# 20 mm treated a 2 cm Y miss as arrived, so the next shot was never sent.
-DIRECT_PBVS_ARRIVE_TOL_M = 0.005
+# 5 mm left a Y miss of 5 mm marked arrived, so the arm stopped.
+# The press has to keep moving until every axis is inside 2 mm.
+DIRECT_PBVS_ARRIVE_TOL_M = 0.002
+# A fingertip already deeper than the button is not arrival, even inside 2 mm.
+DIRECT_PBVS_PAST_X_M = 0.001
+# Combination: move off and retry the same press this many times, then the next step.
+SEQUENCE_ACTION_RETRIES = 3
 # Kept so older callers still import. The live path does not use an X gap.
 DIRECT_PBVS_X_CLEAR_M = 0.08
 DIRECT_PBVS_X_LEAD_M = 0.05
@@ -141,7 +151,7 @@ DIRECT_PBVS_START_ROUNDS = 3
 # the exact motion-control roll.
 # 15 mm rejected a pitch-8 solution at 16.0 mm / 9° / 99°.
 # 25 mm / 150° then rejected the same kind of lift at 38.9 mm / 24.6° / 151°.
-# 80 mm is still a bad solve and must not be sent. Arrival stays at 5 mm.
+# 80 mm is still a bad solve and must not be sent. Arrival stays at 2 mm.
 DIRECT_PBVS_POSE_POS_TOL_M = 0.045
 DIRECT_PBVS_POSE_ROT_TOL_DEG = 25.0
 DIRECT_PBVS_MIN_JOINT_DEG = 165.0
@@ -273,8 +283,8 @@ def close_range_forward_x(
     if pbvs_x_m is not None and math.isfinite(float(pbvs_x_m)):
         button_x = float(pbvs_x_m)
         if current >= button_x:
-            return current
-        goal = min(max(goal, button_x), button_x)
+            return button_x
+        goal = min(goal, button_x)
     return goal
 
 
@@ -399,7 +409,7 @@ def pbvs_features_ready(telem: dict[str, Any]) -> bool:
 def pbvs_forward_step(
     error_m: Sequence[float],
     *,
-    yz_tol_m: float = PBVS_FORWARD_YZ_TOL_M,
+    yz_tol_m: float = PBVS_XY_TOL_M,
     arrive_m: float = PBVS_XY_TOL_M,
     max_step_m: float = PBVS_MAX_STEP_M,
 ) -> tuple[float, float, float] | None:
@@ -608,7 +618,7 @@ def pbvs_lateral_step(
 def pbvs_descent_step(
     error_m: Sequence[float],
     *,
-    height_m: float = PBVS_FORWARD_YZ_TOL_M,
+    height_m: float = PBVS_XY_TOL_M,
     max_step_m: float = PBVS_MAX_STEP_M,
 ) -> tuple[float, float, float] | None:
     """Step only in torso -Z when the tip is already well above the goal.
@@ -625,6 +635,98 @@ def pbvs_descent_step(
     if not math.isfinite(ez) or ez >= -float(height_m):
         return None
     return (0.0, 0.0, max(-float(max_step_m), ez))
+
+
+def pbvs_yz_aligned(
+    error_m: Sequence[float],
+    yz_tol_m: float = PBVS_XY_TOL_M,
+) -> bool:
+    """True when torso Y and Z are already inside the PBVS gate."""
+    if len(error_m) != 3:
+        return False
+    try:
+        ey, ez = float(error_m[1]), float(error_m[2])
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(ey) or not math.isfinite(ez):
+        return False
+    return abs(ey) <= float(yz_tol_m) and abs(ez) <= float(yz_tol_m)
+
+
+def pbvs_yz_hold_goal(
+    current: Sequence[float],
+    button: Sequence[float],
+    *,
+    x_clear_m: float = PBVS_YZ_X_CLEAR_M,
+    yz_tol_m: float = PBVS_XY_TOL_M,
+) -> tuple[float, float, float] | None:
+    """Button Y and Z, with X held at least x_clear_m short of the button.
+
+    None means Y and Z are already aligned, so the caller may close X.
+    A tip that is already farther back stays at its current X.
+    """
+    try:
+        cx, _cy, _cz = (float(value) for value in current)
+        bx, by, bz = (float(value) for value in button)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (cx, bx, by, bz)):
+        return None
+    error = (bx - cx, by - float(current[1]), bz - float(current[2]))
+    if pbvs_yz_aligned(error, yz_tol_m):
+        return None
+    return (min(cx, bx - float(x_clear_m)), by, bz)
+
+
+def pbvs_yz_align_step(
+    error_m: Sequence[float],
+    *,
+    x_clear_m: float = PBVS_YZ_X_CLEAR_M,
+    yz_tol_m: float = PBVS_XY_TOL_M,
+    max_step_m: float = PBVS_MAX_STEP_M,
+) -> tuple[float, float, float] | None:
+    """Move Y and Z onto the button. X only backs up to restore x_clear_m.
+
+    None when Y and Z are already inside tolerance. A forward X step is not
+    included: that waits until this move is solved or YZ is aligned.
+    """
+    if len(error_m) != 3:
+        return None
+    try:
+        ex, ey, ez = (float(value) for value in error_m)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (ex, ey, ez)):
+        return None
+    if abs(ey) <= float(yz_tol_m) and abs(ez) <= float(yz_tol_m):
+        return None
+    step = float(max_step_m)
+    dx = 0.0
+    if ex < float(x_clear_m):
+        dx = max(ex - float(x_clear_m), -step)
+    dy = 0.0 if abs(ey) <= float(yz_tol_m) else max(-step, min(step, ey))
+    dz = 0.0 if abs(ez) <= float(yz_tol_m) else max(-step, min(step, ez))
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9 and abs(dz) < 1e-9:
+        return None
+    return (dx, dy, dz)
+
+
+def pbvs_x_step(
+    error_m: Sequence[float],
+    *,
+    arrive_m: float = PBVS_XY_TOL_M,
+    max_step_m: float = PBVS_MAX_STEP_M,
+) -> tuple[float, float, float] | None:
+    """Close torso +X without waiting for Y or Z. None when X is not still short."""
+    if len(error_m) != 3:
+        return None
+    try:
+        ex = float(error_m[0])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ex) or ex <= float(arrive_m):
+        return None
+    return (min(ex, float(max_step_m)), 0.0, 0.0)
 
 
 def pbvs_coarse_delta(
@@ -649,6 +751,40 @@ def should_jog_ibvs(telem: dict[str, Any], height_locked: bool) -> bool:
     return ibvs_features_ready(telem)
 
 
+def direct_pbvs_round_stalled(distance_m: float, round_start_m: float, track_rad: float) -> bool:
+    """A round that gained under 2 mm is finished only after the joints have settled.
+
+    Eight degrees of lag is about 70 mm at the fingertip. Quitting there leaves
+    the press short of the 2 mm gate.
+    """
+    if float(distance_m) <= DIRECT_PBVS_ARRIVE_TOL_M:
+        return True
+    if float(track_rad) > math.radians(1.5):
+        return False
+    return float(round_start_m) - float(distance_m) < 0.002
+
+
+def direct_pbvs_arrived(error_m: Sequence[float]) -> bool:
+    """True only when the tip is within 2 mm and not past the button in X.
+
+    error_m is goal minus tip. Negative X means the fingertip is already
+    deeper than the key. X -3 mm must stay 未到位.
+    """
+    if len(error_m) != 3:
+        return False
+    try:
+        ex, ey, ez = (float(value) for value in error_m)
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (ex, ey, ez)):
+        return False
+    if math.sqrt(ex * ex + ey * ey + ez * ez) > DIRECT_PBVS_ARRIVE_TOL_M:
+        return False
+    if ex < -DIRECT_PBVS_PAST_X_M:
+        return False
+    return True
+
+
 def direct_pbvs_yz_error(current: Sequence[float], button: Sequence[float]) -> float:
     return math.hypot(float(button[1]) - float(current[1]), float(button[2]) - float(current[2]))
 
@@ -666,6 +802,11 @@ def relax_x_clearance(
     if float(yz_after_m) <= float(yz_before_m) - float(stall_m):
         return float(x_clear_m)
     return max(0.0, float(x_clear_m) - float(relax_m))
+
+
+def cap_tool_x(point: Sequence[float], limit_x: float) -> tuple[float, float, float]:
+    """Torso +X is into the panel. The fingertip must not be commanded past the button."""
+    return (min(float(point[0]), float(limit_x)), float(point[1]), float(point[2]))
 
 
 def direct_pbvs_motion_goal(
@@ -1112,6 +1253,7 @@ class ArmMover:
         pbvs_step_seconds: float = PBVS_STEP_SECONDS,
         pbvs_max_joint_deg: float = 20.0,
         motion_backend: str = "arm_sdk",
+        right_ee: str = "dex1",
     ) -> None:
         self.iface = iface
         self.telemetry = telemetry
@@ -1119,15 +1261,23 @@ class ArmMover:
         self.log = log
         self.on_ee_pose = on_ee_pose
         self.wrist_watch = None
+        self.prepare_right_hand = None
         self.wrist_hold = None
         self.wrist_view = None
         self.cam2hand_matrix = None
         self.on_screen_capture = None
+        self.on_screen_record = None
+        self.on_task_begin = None
+        self.on_task_end = None
         self.read_screen = None
         self.screen_settle_s = 0.6
         self._screen_progress = False
         self._screen_report = ""
         self._screen_history: list[str] = []
+        self._action_pose_history: list[str] = []
+        self._action_pose_pending = False
+        self._action_label = ""
+        self._action_goal: tuple[float, float, float] | None = None
         self._screen_block: dict[str, Any] | None = None
         self._screen_before = None
         self._screen_before_info: dict[str, Any] | None = None
@@ -1144,6 +1294,22 @@ class ArmMover:
         self.pbvs_step_m = max(0.005, min(0.04, float(pbvs_step_m)))
         self.pbvs_step_seconds = max(0.20, min(1.0, float(pbvs_step_seconds)))
         self.pbvs_max_joint_deg = max(5.0, min(30.0, float(pbvs_max_joint_deg)))
+        self.right_ee = str(right_ee or "dex1").strip().lower()
+        if self.right_ee == "revo2":
+            from ibvs_pad_touch.web.revo2_index_pad import index_tip_in_wrist, index_tip_tool_rpy_deg
+
+            self.tool_offset_wrist_m = index_tip_in_wrist()
+            self.tool_rpy_deg = index_tip_tool_rpy_deg()
+            self.log(
+                "[ARM] 右手末端=Revo2 食指指尖 "
+                f"xyz={tuple(round(value, 4) for value in self.tool_offset_wrist_m)} m "
+                f"rpy={tuple(round(value, 2) for value in self.tool_rpy_deg)} deg"
+            )
+        elif self.right_ee == "dex1":
+            self.tool_offset_wrist_m = RIGHT_EE_OFFSET_WRIST_M
+            self.tool_rpy_deg = DIRECT_EE_RPY_DEG
+        else:
+            raise ValueError("right_ee 只能是 dex1 或 revo2")
         self.controller: Any = None
         self.ik: Any = None
         self._stop = threading.Event()
@@ -1217,6 +1383,7 @@ class ArmMover:
         self._sequence_run = False
         self._sequence_stage = ""
         self._sequence_index = -1
+        self._retry_count = 0
         self._sequence_lock = threading.Lock()
         self._sequence_skip = 0
         self._sequence_inside = False
@@ -1242,7 +1409,7 @@ class ArmMover:
         return {
             "enabled": self.confirm,
             "phase": self.phase,
-            "message": self.message,
+            "message": self._message_for_page(),
             "running": self._running.is_set(),
             "scanning": self._scanning.is_set(),
             "leveling_right": self._level_right.is_set(),
@@ -1266,6 +1433,25 @@ class ArmMover:
             "direct_ee_poke": self.direct_ee_poke,
             "servo_mode": self.servo_mode(),
             "motion_backend": self._motion_backend,
+            "right_ee": self.right_ee,
+            "waist_yaw_error_deg": (
+                None
+                if self.controller is None
+                else getattr(self.controller, "waist_yaw_error_deg", None)
+            ),
+            "waist_yaw_tau": (
+                None if self.controller is None else getattr(self.controller, "waist_yaw_tau", None)
+            ),
+            "body_yaw_error_deg": (
+                None
+                if self.controller is None
+                else getattr(self.controller, "body_yaw_error_deg", None)
+            ),
+            "body_yaw_rate": (
+                None if self.controller is None else getattr(self.controller, "body_yaw_rate", None)
+            ),
+            "tool_offset_wrist_m": [round(float(value), 4) for value in self.tool_offset_wrist_m],
+            "tool_rpy_deg": [round(float(value), 2) for value in self.tool_rpy_deg],
             "pbvs_step_m": self.pbvs_step_m,
             "pbvs_step_seconds": self.pbvs_step_seconds,
             "pbvs_max_joint_deg": self.pbvs_max_joint_deg,
@@ -1281,6 +1467,7 @@ class ArmMover:
             "screen_progress": self._screen_progress,
             "screen_report": self._screen_report,
             "screen_history": list(self._screen_history),
+            "action_pose_history": list(self._action_pose_history),
             "screen_block": None if self._screen_block is None else dict(self._screen_block),
             "sequence_run": self._sequence_run,
             "sequence_stage": self._sequence_stage,
@@ -1861,6 +2048,7 @@ class ArmMover:
             self._control_stage = "DIRECT_PBVS"
             kind = "Direct PBVS" if self._sequence_mode == "direct_pbvs" else "Hybrid"
             self.message = f"组合启动 {kind}：{names}"
+            self._emit_task_begin()
             return self.message
         if self.direct_ee_poke:
             self._control_stage = "DIRECT_EE_ALIGN_YZ"
@@ -1875,6 +2063,22 @@ class ArmMover:
             self._control_stage = "DUAL_IBVS"
             self.message = "Start：兼容胸视/侧视模式；建议选择 Hybrid VS 使用右腕 Eye-in-Hand"
         return self.message
+
+    def _prepare_right_hand(self) -> str:
+        """Index out, every other finger closed, before the arm moves."""
+        fn = self.prepare_right_hand
+        if not callable(fn):
+            self.message = "右手 Revo2 没有接上，不能进入食指预备姿势"
+            self.log(f"[ARM][WARN] {self.message}")
+            return self.message
+        message = str(fn() or "")
+        if "食指" not in message:
+            self.message = message or "右手没有进入食指预备姿势"
+            self.log(f"[ARM][WARN] {self.message}")
+            return self.message
+        self.message = f"{message}，外展后手指到位，继续上举"
+        self.log(f"[ARM] {self.message}")
+        return ""
 
     def pause(self) -> str:
         self._stop_playback()
@@ -2114,13 +2318,15 @@ class ArmMover:
         return result
 
     def release_for_operator(self) -> str:
-        """Drop arm_sdk on both arms. Cameras keep running for the motion engineer."""
+        """Drop the current arm_sdk holder. Do not blend weight or start another publisher."""
+        self._record_action_pose("已释放")
         self._stop_playback()
         if self.controller is None and (self._thread is None or not self._thread.is_alive()):
             self.phase = "released"
             self._control_stage = "RELEASED"
             self._left_side_ready = False
-            self.message = "双臂已释放。再点 arm_sdk 会先停止运控服务，然后本页接管。"
+            self.message = "双臂已释放。arm_sdk 已关闭。"
+            self._emit_task_end("stopped")
             return self.message
         self._ibvs_enabled = False
         self._control_stage = "RELEASED"
@@ -2128,32 +2334,42 @@ class ArmMover:
         self._scanning.clear()
         self._scan_needs_prepare = False
         self._running.clear()
+        self._return_ready.clear()
+        self._hang_down.clear()
+        self._level_right.clear()
         self._height_locked = False
         self._seek_done = False
         self._stop.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=10.0)
-        self._thread = None
         controller = self.controller
-        self.controller = None
         if controller is not None:
+            abort = getattr(controller, "abort", None)
             try:
-                self.log("[ARM] 释放：本进程不占用 arm_sdk，运控服务继续持有")
-                controller.release(seconds=1.2)
+                if callable(abort):
+                    self.log("[ARM] 释放：只关闭当前 arm_sdk，不拉起运控服务")
+                    abort()
+                else:
+                    self.log("[ARM] 释放：当前控制器没有 abort，改发 weight=0")
+                    controller.release(seconds=0.0)
             except Exception as exc:
                 self.log(f"[ARM] 松权失败: {exc}")
                 try:
-                    controller.release(seconds=0.8)
+                    controller.release(seconds=0.0)
                 except Exception as release_exc:
                     self.log(f"[ARM] release: {release_exc}")
+        self.controller = None
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         self.phase = "released"
-        self.message = "已释放双臂。再点 arm_sdk 会先停止运控服务，然后本页接管。"
+        self.message = "已释放双臂。arm_sdk 已关闭，没有拉起新的控制。"
         self.log(f"[ARM] {self.message}")
+        self._emit_task_end("stopped")
         return self.message
 
     def emergency_stop(self) -> str:
         """Drop both arms now and release SDK and the service node. No pose plan."""
+        self._record_action_pose("已释放")
         self._stop_playback()
         self._ibvs_enabled = False
         self._control_stage = "ESTOP"
@@ -2192,6 +2408,7 @@ class ArmMover:
             thread.join(timeout=0.2)
         self.message = "急停：双臂已立即松开，控制已释放"
         self.log(f"[ARM] {self.message}")
+        self._emit_task_end("stopped")
         return self.message
 
     def _kill_service_now(self) -> None:
@@ -2275,8 +2492,12 @@ class ArmMover:
             return
         try:
             self.log("[ARM] 退出：放下左右臂并交回 arm_sdk")
-            controller.ramp_arm("left", LEFT_REST_DEG, seconds=6.0, dt=0.02)
-            self.controller.ramp_arm("right", REST_DEG, seconds=6.0, dt=0.02)
+            self._ramp_arms(
+                (
+                    ("left", LEFT_REST_DEG, 6.0),
+                    ("right", REST_DEG, 6.0),
+                )
+            )
             controller.release(seconds=1.2)
             self.phase = "released"
             self.message = "已放下并交回 arm_sdk"
@@ -2325,12 +2546,13 @@ class ArmMover:
             self.controller = H2ArmSdkController(iface=self.iface)
             self.controller.kp = 85.0
             self.controller.kd = 2.2
+        self.controller.hold_waist_yaw = True
         self.controller.wait_lowstate()
         self._ensure_gravity()
         self.controller.ensure_ai_mode(select_ai=True)
         self.controller.enable_arm_sdk()
         self.ik = H2CameraIK(arm="right")
-        self.log("[ARM] arm_sdk 已接，重力补偿开")
+        self.log("[ARM] arm_sdk 已接，重力补偿开，腰 yaw 补偿开")
         self._publish_ee()
 
     def _ensure_gravity(self) -> None:
@@ -2448,6 +2670,50 @@ class ArmMover:
         self.log(f"[ARM] {self.message}")
         self.controller.ramp_arm("right", target, seconds=3.0, dt=0.02)
 
+    def _parallel_arm_ramps(self) -> bool:
+        """arm_sdk can blend each arm into the same command. The service yaml cannot."""
+        controller = self.controller
+        return (
+            self._motion_backend != "service"
+            and controller is not None
+            and callable(getattr(controller, "write_joints", None))
+        )
+
+    def _ramp_arms(self, moves: Sequence[tuple[str, Sequence[float], float]]) -> None:
+        """Run the listed arm ramps together when the controller can merge joints."""
+        controller = self.controller
+        if controller is None:
+            return
+        if not self._parallel_arm_ramps() or len(moves) < 2:
+            for arm, pose, seconds in moves:
+                controller.ramp_arm(arm, pose, seconds=float(seconds), dt=0.02)
+            return
+        errors: list[BaseException] = []
+
+        def run(arm: str, pose: Sequence[float], seconds: float) -> None:
+            try:
+                controller.ramp_arm(arm, pose, seconds=float(seconds), dt=0.02)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=run, args=move, name=f"ramp-{move[0]}", daemon=True)
+            for move in moves
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+
+    def _raise_right_to_ready(self) -> None:
+        if self._motion_backend != "service":
+            self._swing_right_arm_clear()
+            self.controller.ramp_arm("right", READY_DEG, seconds=6.0, dt=0.02)
+            return
+        self.controller.ramp_arm("right", READY_DEG, seconds=8.0, dt=0.02)
+
     def _prepare_scan_pose(self) -> None:
         if not self._scan_needs_prepare:
             return
@@ -2459,13 +2725,36 @@ class ArmMover:
         self.phase = "raising"
         self.message = "左臂平举侧视，右臂举到点触位"
         self.log("[ARM] 左臂平举、相机朝右看点触；右臂外展举到工作位")
-        self.controller.ramp_arm("left", LEFT_SIDE_VIEW_DEG, seconds=8.0, dt=0.02)
-        self._left_side_ready = True
-        if self._motion_backend != "service":
-            self._swing_right_arm_clear()
-            self.controller.ramp_arm("right", READY_DEG, seconds=6.0, dt=0.02)
+        if self._parallel_arm_ramps():
+            errors: list[BaseException] = []
+
+            def lift_left() -> None:
+                try:
+                    self.controller.ramp_arm("left", LEFT_SIDE_VIEW_DEG, seconds=8.0, dt=0.02)
+                    self._left_side_ready = True
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def lift_right() -> None:
+                try:
+                    self._raise_right_to_ready()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            workers = (
+                threading.Thread(target=lift_left, name="ramp-left", daemon=True),
+                threading.Thread(target=lift_right, name="ramp-right", daemon=True),
+            )
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            if errors:
+                raise errors[0]
         else:
-            self.controller.ramp_arm("right", READY_DEG, seconds=8.0, dt=0.02)
+            self.controller.ramp_arm("left", LEFT_SIDE_VIEW_DEG, seconds=8.0, dt=0.02)
+            self._left_side_ready = True
+            self._raise_right_to_ready()
         self._warn_if_sagging()
         self._scan_needs_prepare = False
         self._scanning.clear()
@@ -2492,8 +2781,12 @@ class ArmMover:
         via_service = self._motion_backend == "service"
         self.message = "Reset：运控服务回到放下位" if via_service else "Reset：回到放下位，arm_sdk 保持"
         self.log("[ARM] Reset 回 Ctrl+C 放下位，不释放当前链路")
-        self.controller.ramp_arm("left", LEFT_REST_DEG, seconds=6.0, dt=0.02)
-        self.controller.ramp_arm("right", REST_DEG, seconds=6.0, dt=0.02)
+        self._ramp_arms(
+            (
+                ("left", LEFT_REST_DEG, 6.0),
+                ("right", REST_DEG, 6.0),
+            )
+        )
         self._height_locked = False
         self._seek_done = False
         self._control_stage = "HOLD"
@@ -2530,8 +2823,12 @@ class ArmMover:
         self.phase = "hanging"
         self.message = "下垂：双臂收到身体两侧"
         self.log("[ARM] 运控服务下垂到身体两侧")
-        self.controller.ramp_arm("left", LEFT_HANG_DEG, seconds=8.0, dt=0.02)
-        self.controller.ramp_arm("right", RIGHT_HANG_DEG, seconds=8.0, dt=0.02)
+        self._ramp_arms(
+            (
+                ("left", LEFT_HANG_DEG, 8.0),
+                ("right", RIGHT_HANG_DEG, 8.0),
+            )
+        )
         self._height_locked = False
         self._seek_done = False
         self._control_stage = "HOLD"
@@ -2581,7 +2878,7 @@ class ArmMover:
             xyz, rpy = self.ik.fk_xyz_rpy(q_rad)
             tip_fn = getattr(self.ik, "tip_xyz", None)
             tool_xyz = (
-                tip_fn(q_rad, RIGHT_EE_OFFSET_WRIST_M)
+                tip_fn(q_rad, self.tool_offset_wrist_m)
                 if callable(tip_fn)
                 else xyz
             )
@@ -2739,8 +3036,13 @@ class ArmMover:
             if self._screen_progress and not self._return_ready.is_set() and not self._stop.is_set():
                 self._run_single_press_with_screen(telem, direct=True)
                 return
-            self._fuse_wrist_pbvs(telem)
-            telem = self.telemetry() or telem
+            chest = self._snapshot_chest_buttons(telem)
+            if chest:
+                self._locked_buttons = dict(chest)
+            self._pbvs_source = "chest"
+            if callable(self.wrist_watch):
+                self.wrist_watch(False)
+            self.log("[ARM] Direct PBVS 只用胸口坐标，不等待右腕")
         if self._control_stage == "DIRECT_PBVS":
             self._direct_pbvs_once(telem)
             return
@@ -2936,8 +3238,36 @@ class ArmMover:
             return 0.0, True
         return dy, False
 
+    def _tool_xyz(self, q_rad) -> tuple[float, float, float]:
+        """Tool point in torso_link. Older Hand_Eye_Calib builds have no tip_xyz."""
+        offset = self.tool_offset_wrist_m
+        tip_fn = getattr(self.ik, "tip_xyz", None)
+        if callable(tip_fn):
+            try:
+                point = tip_fn(q_rad, offset)
+            except TypeError:
+                point = tip_fn(q_rad)
+            return tuple(float(value) for value in point)
+        matrix_fn = getattr(self.ik, "fk_matrix", None)
+        if callable(matrix_fn):
+            pose = matrix_fn(q_rad)
+            tip = [float(pose[row][3]) for row in range(3)]
+            for row in range(3):
+                tip[row] += sum(float(pose[row][col]) * float(offset[col]) for col in range(3))
+            return (tip[0], tip[1], tip[2])
+        fk = getattr(self.ik, "fk_xyz_rpy", None)
+        if not callable(fk):
+            raise RuntimeError("FK 指尖模型不可用")
+        from ibvs_pad_touch.servo.virtual_tip import apply_ee_offset
+
+        xyz, rpy = fk(q_rad)
+        return apply_ee_offset(xyz, rpy, offset)
+
+    def _nominal_tool_rpy_deg(self) -> tuple[float, float, float]:
+        return tuple(float(value) for value in self.tool_rpy_deg)
+
     def _nominal_tool_rpy(self) -> tuple[float, float, float]:
-        return tuple(math.radians(value) for value in DIRECT_EE_RPY_DEG)
+        return tuple(math.radians(value) for value in self._nominal_tool_rpy_deg())
 
     def _pbvs_path_candidates(
         self,
@@ -2986,7 +3316,7 @@ class ArmMover:
         kwargs = {
             "target_tool_xyz_m": xyz,
             "target_tool_rpy_rad": rpy,
-            "tool_offset_wrist_m": RIGHT_EE_OFFSET_WRIST_M,
+            "tool_offset_wrist_m": self.tool_offset_wrist_m,
         }
         if seed is not None:
             kwargs["seed_q_rad"] = seed
@@ -3023,12 +3353,11 @@ class ArmMover:
         return ok, jump
 
     def _tip_miss(self, q_rad, goal: tuple[float, float, float]):
-        """Fingertip minus the button. None when FK cannot answer."""
-        tip_fn = getattr(self.ik, "tip_xyz", None)
-        if not callable(tip_fn) or not q_rad:
+        """Tool point minus the button. Uses the active pad or gripper offset."""
+        if not q_rad:
             return None
         try:
-            tip = tuple(float(value) for value in tip_fn(q_rad))
+            tip = self._tool_xyz(q_rad)
         except Exception:
             return None
         if len(tip) != 3 or not all(math.isfinite(value) for value in tip):
@@ -3047,7 +3376,7 @@ class ArmMover:
             kwargs = {
                 "target_tool_xyz_m": xyz,
                 "target_tool_rpy_rad": rpy,
-                "tool_offset_wrist_m": RIGHT_EE_OFFSET_WRIST_M,
+                "tool_offset_wrist_m": self.tool_offset_wrist_m,
             }
             if seed is not None:
                 kwargs["seed_q_rad"] = seed
@@ -3154,6 +3483,25 @@ class ArmMover:
                 "ok": False,
                 "tried": tried,
             }
+            try:
+                solved_tip = self._tool_xyz(endpoint.get("q_solved") or endpoint["q_command"])
+            except Exception:
+                solved_tip = None
+            if solved_tip is not None and len(solved_tip) == 3:
+                if float(solved_tip[0]) > float(goal[0]) + 1e-4:
+                    self.log(
+                        f"[ARM] PBVS {label} 指尖 X {solved_tip[0]*1000:.0f}mm "
+                        f"超过目标 {float(goal[0])*1000:.0f}mm，换下一条"
+                    )
+                    continue
+                requested_z = float(goal[2]) - float(current_tip[2])
+                solved_z = float(solved_tip[2]) - float(current_tip[2])
+                if requested_z * solved_z < 0.0 and abs(requested_z) > 0.01 and abs(solved_z) > 0.01:
+                    self.log(
+                        f"[ARM] PBVS {label} 竖直方向反了，"
+                        f"要 {requested_z*1000:.0f}mm 解出 {solved_z*1000:.0f}mm，换下一条"
+                    )
+                    continue
             if pose_ok and not self._solved_tip_reaches(endpoint.get("q_solved"), goal):
                 miss = self._tip_miss(endpoint.get("q_solved"), goal)
                 if miss is not None:
@@ -3171,13 +3519,17 @@ class ArmMover:
             knot_count = max(2, int(math.ceil(seconds / MOTION_KNOT_S)) + 1)
             knots = []
             solved_seed = seed
+            blocked_by_x = False
             for step in range(knot_count - 1):
                 if self._return_ready.is_set():
                     return None
                 blend = quintic_blend(step / (knot_count - 1))
-                xyz = tuple(
-                    current_tip[index] * (1.0 - blend) + goal[index] * blend
-                    for index in range(3)
+                xyz = cap_tool_x(
+                    tuple(
+                        current_tip[index] * (1.0 - blend) + goal[index] * blend
+                        for index in range(3)
+                    ),
+                    float(goal[0]),
                 )
                 rpy = slerp_rpy(start_rpy, goal_rpy, blend)
                 sample_seed = seed if step == 0 else solved_seed
@@ -3185,6 +3537,18 @@ class ArmMover:
                     solve_pose, commanded, measured, xyz, rpy, sample_seed
                 )
                 if result is None:
+                    break
+                try:
+                    knot_tip = self._tool_xyz(result.get("q_solved") or result["q_command"])
+                except Exception:
+                    knot_tip = None
+                if knot_tip is not None and float(knot_tip[0]) > float(goal[0]) + 1e-4:
+                    self.log(
+                        f"[ARM] PBVS {label} 路径点 X {float(knot_tip[0])*1000:.0f}mm "
+                        f"超过目标 {float(goal[0])*1000:.0f}mm，换下一条"
+                    )
+                    knots = []
+                    blocked_by_x = True
                     break
                 sample_ok, _sample_jump = self._pose_command_ok(
                     result["q_command"],
@@ -3197,6 +3561,8 @@ class ArmMover:
                     break
                 knots.append(list(result["q_command"]))
                 solved_seed = list(result["q_solved"])
+            if blocked_by_x:
+                continue
             if not knots:
                 # Midpoint solves can fail while the one-shot goal is fine.
                 # With no chain there is no elbow branch to keep.
@@ -3326,7 +3692,11 @@ class ArmMover:
         )
         miss = found.get("tip_miss_m")
         if miss and len(miss) == 3:
-            text += f"，指尖还差 Z {float(miss[2])*1000:.0f}mm"
+            text += (
+                "，指腹还差 "
+                f"X {float(miss[0])*1000:.0f} Y {float(miss[1])*1000:.0f} "
+                f"Z {float(miss[2])*1000:.0f} mm"
+            )
         return text
 
     def _correct_height_from_chest(self, ee_xyz, *, phase: str) -> bool:
@@ -3533,7 +3903,7 @@ class ArmMover:
         tip_xyz = getattr(self.ik, "tip_xyz", None)
         if measured and callable(tip_xyz):
             try:
-                point = tip_xyz(measured, RIGHT_EE_OFFSET_WRIST_M)
+                point = tip_xyz(measured, self.tool_offset_wrist_m)
                 value = _finite_float(point[0])
                 if value is not None:
                     return value
@@ -3626,9 +3996,9 @@ class ArmMover:
             self._wrist_close_advance_m = forward_m
             self.message = f"近距已对齐，向前 {forward_m * 1000:.0f}mm 到 X {goal_x:.3f}"
 
-    def _retract_if_deeper_than_button(self, error, phase: str) -> bool:
+    def _retract_if_deeper_than_button(self, error, phase: str, past_m: float = PBVS_XY_TOL_M) -> bool:
         """Back out in X before any raise when the jaw is already past the key."""
-        retract = pbvs_retract_step(error)
+        retract = pbvs_retract_step(error, past_m=past_m)
         if retract is None:
             return False
         self._forward_hold = True
@@ -3773,7 +4143,8 @@ class ArmMover:
         # The wrist sample is not a fresh button. The pose tip often sits on
         # the keys while the jaw is still above the panel, so use the gripper
         # mask in the chest image before waiting on the wrist.
-        if (not clicked) and self._chest_height_after_pbvs and not image_ready:
+        wrist_has_target = image_ready or close_range
+        if (not clicked) and self._chest_height_after_pbvs and not wrist_has_target:
             jaw_gap = _chest_pixel_gap(telem.get("chest_pose_button_uv"), telem.get("chest_gripper_uv"))
             if jaw_gap is not None and abs(jaw_gap) > CHEST_POSE_HEIGHT_PX:
                 step = -WRIST_APPROACH_MAX_STEP_M if jaw_gap < 0.0 else WRIST_APPROACH_MAX_STEP_M
@@ -3801,7 +4172,7 @@ class ArmMover:
             if self._chest_height_after_pbvs
             else None
         )
-        if (not clicked) and height is not None:
+        if (not clicked) and not wrist_has_target and height is not None:
             height_z, height_message = height
             self._apply_torso_delta(
                 (0.0, 0.0, height_z),
@@ -3820,6 +4191,12 @@ class ArmMover:
                 view.get("intrinsics") or {},
                 pbvs_x=self._pbvs_target_x(telem, goal_name),
             )
+            if (
+                str(view.get("target_source") or "") == "yellow_bar"
+                and not str(self.message).startswith(("IK 拒绝", "IBVS 服务失败"))
+                and "黄色长条" not in self.message
+            ):
+                self.message = "按键未看到，对齐最近黄色长条，" + self.message
             return
         if bool(view.get("occluded")) and not image_ready and latched is None:
             self.phase = "wrist_occluded"
@@ -3895,11 +4272,14 @@ class ArmMover:
         )
         pixel_err = float(command["pixel_err"])
         depth_err = command["depth_err_m"]
+        yellow_bar = str(view.get("target_source") or "") == "yellow_bar"
+        aim = "最近黄色长条" if yellow_bar else "按键"
         if bool(command["arrived"]):
             self.phase = "wrist_wait_contact"
             depth_mm = 0.0 if depth_err is None else abs(float(depth_err)) * 1000.0
             self.message = (
-                f"右腕 IBVS 已对准，像素差 {pixel_err:.0f}px，深度差 {depth_mm:.1f}mm，等待接触"
+                f"右腕 IBVS 指尖已对齐{aim}，像素差 {pixel_err:.0f}px，"
+                f"深度差 {depth_mm:.1f}mm，等待接触"
             )
             if clicked:
                 self.message = "跟踪点选黄色区域，" + self.message
@@ -3911,10 +4291,17 @@ class ArmMover:
             limit_m=WRIST_APPROACH_MAX_STEP_M,
         )
         if not self.message.startswith(("IK 拒绝", "IBVS 服务失败")):
-            if depth_err is None:
-                self.message = f"右腕 IBVS 像素差 {pixel_err:.0f}px，指尖深度缺失，对齐后前送"
+            if pixel_err > WRIST_IBVS_PIXEL_TOL:
+                self.message = (
+                    f"先对齐指尖和{aim}，像素差 {pixel_err:.0f}px，先不深入"
+                )
+            elif depth_err is None:
+                self.message = f"指尖已对齐{aim}，像素差 {pixel_err:.0f}px，沿前方深入"
             else:
-                self.message = f"右腕 IBVS 像素差 {pixel_err:.0f}px，深度差 {float(depth_err)*1000:.1f}mm"
+                self.message = (
+                    f"指尖已对齐{aim}，像素差 {pixel_err:.0f}px，"
+                    f"深入还差 {float(depth_err)*1000:.1f}mm"
+                )
             if clicked:
                 self.message = "跟踪点选黄色区域，" + self.message
 
@@ -3965,6 +4352,81 @@ class ArmMover:
             return True, f"{prefix}{label} 已发送修正"
         return True, f"{prefix}{label} 修正后还差 {final*1000:.0f}mm{ztxt}"
 
+    def _can_axis_step(self) -> bool:
+        """True when a pure fingertip translation can be solved without a 6-DoF pose."""
+        if callable(getattr(self.controller, "move_delta", None)):
+            return True
+        ik = self.ik
+        return callable(getattr(ik, "apply_tip_delta", None)) or callable(getattr(ik, "apply_delta", None))
+
+    def _yz_align_text(self, error, step) -> str:
+        """Status line for a YZ alignment step that keeps the X gap."""
+        dx, dy, dz = (float(value) for value in step)
+        if abs(dy) < 1e-6 and abs(dx) < 1e-6 and dz < -1e-6:
+            return (
+                f"末端高于目标 {abs(float(error[2]))*1000:.0f}mm，"
+                f"下降 {abs(dz)*1000:.0f}mm"
+            )
+        parts = [f"先对齐 YZ，X 保持 {PBVS_YZ_X_CLEAR_M*1000:.0f}mm"]
+        if abs(dy) >= 1e-6:
+            parts.append(f"Y 方向 {dy*1000:.0f}mm")
+        if dz < -1e-6:
+            parts.append(f"下降 {abs(dz)*1000:.0f}mm")
+        elif dz > 1e-6:
+            parts.append(f"抬高 {dz*1000:.0f}mm")
+        if dx < -1e-6:
+            parts.append(f"X 退 {abs(dx)*1000:.0f}mm")
+        return "，".join(parts)
+
+    def _yz_attempt_stalled(self, goal_key, yz_now: float) -> bool:
+        """True when the previous YZ attempt on this button did not get closer."""
+        previous = getattr(self, "_pbvs_yz_before", None)
+        if previous is None or previous[0] != goal_key:
+            return False
+        return float(yz_now) > float(previous[1]) - DIRECT_PBVS_YZ_STALL_M
+
+    def _step_x_after_yz(
+        self,
+        error,
+        phase: str,
+        *,
+        max_tip_x: float | None = None,
+        tip_x: float | None = None,
+    ) -> bool:
+        """Move +X after YZ is aligned or the YZ-only step was rejected."""
+        forward = pbvs_x_step(error)
+        if forward is None:
+            return False
+        step_x = float(forward[0])
+        if max_tip_x is not None and tip_x is not None:
+            room = float(max_tip_x) - float(tip_x)
+            if room <= 1e-4:
+                return False
+            step_x = min(step_x, room)
+        forward = (step_x, 0.0, 0.0)
+        before = self._tool_xyz_measured()
+        self._apply_torso_delta(
+            forward,
+            seconds=PBVS_STEP_SECONDS,
+            phase=phase,
+            limit_m=forward[0],
+        )
+        if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+            self._forward_hold = False
+            return False
+        after = self._tool_xyz_measured()
+        moved_x = 0.0 if before is None or after is None else float(after[0]) - float(before[0])
+        if moved_x < 0.002:
+            self._forward_hold = False
+            return False
+        self._forward_hold = True
+        self._pbvs_yz_before = None
+        self.message = (
+            f"YZ 解不出，尝试 X，向前 {forward[0]*1000:.0f}mm，"
+            f"X 还差 {float(error[0])*1000:.0f}mm"
+        )
+        return True
+
     def _step_forward_if_aligned(
         self,
         error,
@@ -3984,18 +4446,26 @@ class ArmMover:
                 return False
             step_x = min(step_x, room)
         forward = (step_x, 0.0, 0.0)
-        self._forward_hold = True
+        before = self._tool_xyz_measured()
         self._apply_torso_delta(
             forward,
             seconds=PBVS_STEP_SECONDS,
             phase=phase,
             limit_m=forward[0],
         )
-        if not self.message.startswith(("IK 拒绝", "IBVS 服务失败")):
-            self.message = (
-                f"左右和高度已靠近，向前 {forward[0]*1000:.0f}mm，"
-                f"X 还差 {float(error[0])*1000:.0f}mm"
-            )
+        if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+            self._forward_hold = False
+            return False
+        after = self._tool_xyz_measured()
+        moved_x = 0.0 if before is None or after is None else float(after[0]) - float(before[0])
+        if moved_x < 0.002:
+            self._forward_hold = False
+            return False
+        self._forward_hold = True
+        self.message = (
+            f"左右和高度已靠近，向前 {forward[0]*1000:.0f}mm，"
+            f"X 还差 {float(error[0])*1000:.0f}mm"
+        )
         return True
 
     def _live_chest_xyz(self) -> tuple[float, float, float] | None:
@@ -4024,11 +4494,13 @@ class ArmMover:
             phase=phase,
             limit_m=abs(lateral[1]),
         )
-        if not str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
-            self.message = (
-                f"X 已靠近，Y 方向移动 {lateral[1]*1000:.0f}mm，"
-                f"还差 {float(error[1])*1000:.0f}mm"
-            )
+        if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+            self._forward_hold = False
+            return False
+        self.message = (
+            f"X 已靠近，Y 方向移动 {lateral[1]*1000:.0f}mm，"
+            f"还差 {float(error[1])*1000:.0f}mm"
+        )
         return True
 
     def _pbvs_once(self, telem: dict[str, Any]) -> None:
@@ -4046,7 +4518,7 @@ class ArmMover:
             self.message = "PBVS 等待实测关节 FK 指尖"
             return
         try:
-            current_tip = tuple(float(value) for value in tip_xyz(measured))
+            current_tip = self._tool_xyz(measured)
         except Exception as exc:
             self.phase = "pbvs_wait_fk"
             self.message = f"PBVS FK 失败: {exc}"
@@ -4120,47 +4592,117 @@ class ArmMover:
             self.phase = "pbvs_coarse"
             self._control_stage = "PBVS_COARSE"
             return
-        # Chest pose owns height once X/Y are close, and it may either raise
-        # or lower. A pure upward step from the start of the reach swings the
-        # arm out to the right, so this stays behind that gate.
-        if (done or close_xy) and self._correct_height_from_chest(current_tip, phase="PBVS_COARSE"):
-            self.phase = "pbvs_coarse"
-            self._control_stage = "PBVS_COARSE"
-            return
-        descent = None if live_arrived else pbvs_descent_step(error_torso)
-        if descent is not None and not callable(getattr(self.controller, "move_cartesian", None)):
-            self._forward_hold = True
-            self._apply_torso_delta(
-                descent,
-                seconds=PBVS_STEP_SECONDS,
-                phase="PBVS_COARSE",
-                limit_m=abs(descent[2]),
-            )
-            if not str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
-                self.message = (
-                    f"末端高于目标 {abs(error_torso[2])*1000:.0f}mm，"
-                    f"下降 {abs(descent[2])*1000:.0f}mm"
+        # Align Y and Z first. X stays at least 2 cm short until that alignment
+        # is done, or until the YZ-only step cannot be solved.
+        button_xyz = (x_pbvs, float(coarse_target[1]), float(coarse_target[2]))
+        yz_now = math.hypot(float(error_torso[1]), float(error_torso[2]))
+        goal_key = tuple(round(float(value), 3) for value in button_xyz)
+        yz_ready = live_arrived or pbvs_yz_aligned(error_torso)
+        yz_unsolved = (not yz_ready) and self._yz_attempt_stalled(goal_key, yz_now)
+        raised_first = False
+        service_move = callable(getattr(self.controller, "move_cartesian", None))
+        if PBVS_YZ_FIRST and not yz_ready and not yz_unsolved and not service_move and self._can_axis_step():
+            step = pbvs_yz_align_step(error_torso)
+            if step is not None:
+                self._forward_hold = True
+                self._apply_torso_delta(
+                    step,
+                    seconds=PBVS_STEP_SECONDS,
+                    phase="PBVS_COARSE",
+                    limit_m=max(abs(float(value)) for value in step),
                 )
+                if not str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                    self._pbvs_yz_before = (goal_key, yz_now)
+                    self.message = self._yz_align_text(error_torso, step)
+                    self.phase = "pbvs_coarse"
+                    self._control_stage = "PBVS_COARSE"
+                    return
+                # The translation did not move. Keep the YZ pose; do not jog X
+                # while height or lateral error is still open.
+        if PBVS_YZ_FIRST and not yz_ready and not yz_unsolved and service_move:
+            hold = pbvs_yz_hold_goal(current_tip, button_xyz)
+            if hold is not None:
+                rpy_hold = tuple(float(value) for value in self._nominal_tool_rpy_deg())
+                raised_first = float(hold[2]) > float(current_tip[2]) + 0.01
+                ok_hold, _detail_hold = self._play_service_cartesian(
+                    current_tip, hold, rpy_hold, "PBVS"
+                )
+                if not ok_hold:
+                    yz_unsolved = True
+                else:
+                    try:
+                        current_tip = self._tool_xyz(self.controller.measured_arm_rad("right"))
+                    except Exception:
+                        current_tip = None
+                    if current_tip is None:
+                        yz_unsolved = True
+                    else:
+                        error_torso = tuple(
+                            button_xyz[index] - current_tip[index] for index in range(3)
+                        )
+                        yz_after = math.hypot(float(error_torso[1]), float(error_torso[2]))
+                        done = all(abs(value) <= PBVS_XY_TOL_M for value in error_torso)
+                        close_xy = (
+                            abs(error_torso[0]) <= PBVS_FORWARD_YZ_TOL_M
+                            and abs(error_torso[1]) <= PBVS_FORWARD_YZ_TOL_M
+                        )
+                        if pbvs_yz_aligned(error_torso):
+                            yz_ready = True
+                            self._pbvs_yz_before = None
+                        elif yz_after > yz_now - DIRECT_PBVS_YZ_STALL_M:
+                            yz_unsolved = True
+                            self._pbvs_yz_before = None
+                        else:
+                            self._pbvs_yz_before = (goal_key, yz_now)
+                            self.phase = "pbvs_coarse"
+                            self._control_stage = "PBVS_COARSE"
+                            self.message = "先对齐 YZ，X 保持 20mm"
+                            if raised_first:
+                                self.message = "先抬高，" + self.message
+                            return
+        # Image height is only a trim once X/Y are already close.
+        if (yz_ready if PBVS_YZ_FIRST else (done or close_xy)) and self._correct_height_from_chest(
+            current_tip, phase="PBVS_COARSE"
+        ):
             self.phase = "pbvs_coarse"
             self._control_stage = "PBVS_COARSE"
             return
+        if not PBVS_YZ_FIRST and not live_arrived and not service_move:
+            descent = pbvs_descent_step(error_torso)
+            if descent is not None:
+                self._forward_hold = True
+                self._apply_torso_delta(
+                    descent,
+                    seconds=PBVS_STEP_SECONDS,
+                    phase="PBVS_COARSE",
+                    limit_m=abs(descent[2]),
+                )
+                if not str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                    self.message = (
+                        f"末端高于目标 {abs(error_torso[2])*1000:.0f}mm，"
+                        f"下降 {abs(descent[2])*1000:.0f}mm"
+                    )
+                self.phase = "pbvs_coarse"
+                self._control_stage = "PBVS_COARSE"
+                return
         if done:
             self._begin_wrist_approach(self.telemetry() or telem)
             return
-        if not callable(getattr(self.controller, "move_cartesian", None)) and self._step_forward_if_aligned(
+        if (yz_ready or not PBVS_YZ_FIRST) and not service_move and self._step_forward_if_aligned(
             error_torso,
             "PBVS_COARSE",
             max_tip_x=coarse_x_command(x_pbvs),
             tip_x=current_tip[0],
         ):
+            self._pbvs_yz_before = None
             return
-        if not callable(getattr(self.controller, "move_cartesian", None)) and self._step_lateral_if_aligned(
+        if not PBVS_YZ_FIRST and not service_move and self._step_lateral_if_aligned(
             live_error if live_error is not None else error_torso, "PBVS_COARSE"
         ):
             return
         distance = math.sqrt(sum(value * value for value in error_torso))
         if callable(getattr(self.controller, "move_cartesian", None)):
-            rpy = tuple(float(value) for value in DIRECT_EE_RPY_DEG)
+            rpy = tuple(float(value) for value in self._nominal_tool_rpy_deg())
             ok, detail = self._play_service_cartesian(current_tip, coarse_target, rpy, "PBVS")
             if not ok:
                 self._ibvs_enabled = False
@@ -4186,6 +4728,8 @@ class ArmMover:
                 return
             if detail and "先抬高" not in message:
                 message = f"{detail}；{message}"
+            if raised_first and "先抬高" not in message:
+                message = f"先抬高；{message}"
             self._service_pbvs_sent = True
             self.phase = "pbvs_coarse"
             self.message = message
@@ -4195,15 +4739,33 @@ class ArmMover:
             self.phase = "pbvs_ik_rejected"
             self.message = "PBVS 拒绝：运控末端 IK 未更新"
             return
+        pose_goal = coarse_target
+        if PBVS_YZ_FIRST and not yz_ready:
+            hold = pbvs_yz_hold_goal(current_tip, button_xyz)
+            if hold is not None:
+                pose_goal = hold
         found = self._plan_cartesian_tool_move(
             commanded,
             measured,
             current_tip,
-            coarse_target,
+            pose_goal,
             solve_pose,
             must_move=False,
             stage_limited=True,
         )
+        if (found is None or not found["ok"]) and pose_goal is not coarse_target:
+            self._pbvs_yz_before = None
+            found = self._plan_cartesian_tool_move(
+                commanded,
+                measured,
+                current_tip,
+                coarse_target,
+                solve_pose,
+                must_move=False,
+                stage_limited=True,
+            )
+        elif found is not None and found["ok"] and pose_goal is not coarse_target:
+            self._pbvs_yz_before = (goal_key, yz_now)
         if found is None or not found["ok"]:
             # The stage path budget expires with tried=0 even when the jaw is
             # already on the panel. That used to hold instead of starting the
@@ -4281,7 +4843,7 @@ class ArmMover:
                 target[index] + self.direct_ee_poke_depth_m * optical[index]
                 for index in range(3)
             )
-        current = tuple(float(value) for value in tip_xyz(measured, RIGHT_EE_OFFSET_WRIST_M))
+        current = tuple(float(value) for value in tip_xyz(measured, self.tool_offset_wrist_m))
         distance = math.sqrt(sum((motion_target[i] - current[i]) ** 2 for i in range(3)))
         if self.direct_ee_max_m > 0.0 and distance > self.direct_ee_max_m:
             self._finish_direct_ee(
@@ -4294,16 +4856,16 @@ class ArmMover:
                 commanded,
                 measured,
                 target_tip_xyz_m=motion_target,
-                offset_m=RIGHT_EE_OFFSET_WRIST_M,
+                offset_m=self.tool_offset_wrist_m,
             )
         else:
-            rpy = tuple(math.radians(value) for value in DIRECT_EE_RPY_DEG)
+            rpy = tuple(math.radians(value) for value in self._nominal_tool_rpy_deg())
             q_new, ok, pos_err, ori_err = solve_pose(
                 commanded,
                 measured,
                 target_tool_xyz_m=motion_target,
                 target_tool_rpy_rad=rpy,
-                tool_offset_wrist_m=RIGHT_EE_OFFSET_WRIST_M,
+                tool_offset_wrist_m=self.tool_offset_wrist_m,
             )
         jump = max(
             abs(float(after) - float(before))
@@ -4326,7 +4888,7 @@ class ArmMover:
         self._play_joint_target(q_new, 5.0 if (aligning or orienting) else 3.0)
         measured_after = self.controller.measured_arm_rad("right")
         actual_after = tuple(
-            float(value) for value in tip_xyz(measured_after, RIGHT_EE_OFFSET_WRIST_M)
+            float(value) for value in tip_xyz(measured_after, self.tool_offset_wrist_m)
         )
         residual = tuple(motion_target[index] - actual_after[index] for index in range(3))
         residual_norm = math.sqrt(sum(value * value for value in residual))
@@ -4354,7 +4916,7 @@ class ArmMover:
             return
         if orienting:
             _wrist_xyz, actual_rpy = self.ik.fk_xyz_rpy(measured_after)
-            desired_rpy = tuple(math.radians(value) for value in DIRECT_EE_RPY_DEG)
+            desired_rpy = tuple(math.radians(value) for value in self._nominal_tool_rpy_deg())
             angle_errors = [
                 math.atan2(
                     math.sin(desired_rpy[index] - float(actual_rpy[index])),
@@ -4419,6 +4981,7 @@ class ArmMover:
         self.phase = "direct_pbvs_complete" if arrived else "direct_pbvs_short"
         self.message = message
         self.log(f"[ARM] {message}")
+        self._record_action_pose("到位" if arrived else "未到位")
 
     def _goal_from_telem(self, telem: dict[str, Any]) -> tuple[float, float, float] | None:
         name = str(telem.get("target") or "")
@@ -4617,7 +5180,7 @@ class ArmMover:
         """One Cartesian move to an absolute torso point, without the X-gap policy."""
         if self.controller is None:
             return False
-        rpy = tuple(float(value) for value in DIRECT_EE_RPY_DEG)
+        rpy = tuple(float(value) for value in self._nominal_tool_rpy_deg())
         if callable(getattr(self.controller, "move_cartesian", None)):
             ok, detail = self.controller.move_cartesian("right", goal, rpy, seconds=2.0)
             if not ok:
@@ -4627,15 +5190,17 @@ class ArmMover:
             return True
         commanded = self.controller.commanded_arm_rad("right")
         measured = self.controller.measured_arm_rad("right")
-        tip_xyz = getattr(self.ik, "tip_xyz", None)
-        solve_pose = getattr(self.ik, "apply_loaded_tool_pose_target", None)
-        if not commanded or not measured or not callable(tip_xyz) or not callable(solve_pose):
+        solve_pose = None if self.ik is None else getattr(self.ik, "apply_loaded_tool_pose_target", None)
+        if not commanded or not measured or not callable(solve_pose):
             self.message = "抬起失败：末端 IK 不可用"
             return False
         try:
-            current_tip = tuple(float(value) for value in tip_xyz(measured))
+            current_tip = self._measured_tip()
         except Exception as exc:
             self.message = f"抬起失败：{exc}"
+            return False
+        if current_tip is None:
+            self.message = "抬起失败：没有指尖坐标"
             return False
         found = self._plan_cartesian_tool_move(
             commanded,
@@ -4742,7 +5307,7 @@ class ArmMover:
             ok, detail = self._play_service_cartesian(
                 self._measured_tip(),
                 goal,
-                tuple(float(value) for value in DIRECT_EE_RPY_DEG),
+                tuple(float(value) for value in self._nominal_tool_rpy_deg()),
                 f"{name} PBVS",
             )
             if not ok:
@@ -4769,10 +5334,15 @@ class ArmMover:
             self.log(f"[ARM] {self.message}")
             return False
         try:
-            current_tip = tuple(float(value) for value in tip_xyz(measured))
+            current_tip = self._measured_tip()
         except Exception as exc:
             self.phase = "direct_pbvs_rejected"
             self.message = f"PBVS 拒绝：FK 指尖失败 {exc}"
+            self.log(f"[ARM] {self.message}")
+            return False
+        if current_tip is None:
+            self.phase = "direct_pbvs_rejected"
+            self.message = "PBVS 拒绝：没有指尖坐标"
             self.log(f"[ARM] {self.message}")
             return False
         found = self._plan_cartesian_tool_move(
@@ -4797,6 +5367,18 @@ class ArmMover:
         return True
 
     def _run_hybrid_button(self, name: str, goal: tuple[float, float, float]) -> bool:
+        label = SEQUENCE_BUTTON_LABELS.get(name, name)
+        self._begin_action_pose(label, goal)
+        arrived = False
+        try:
+            arrived = bool(self._run_hybrid_button_run(name, goal))
+            return arrived
+        finally:
+            if self._action_pose_pending:
+                outcome = "已释放" if self._stop.is_set() else ("到位" if arrived else "未到位")
+                self._record_action_pose(outcome)
+
+    def _run_hybrid_button_run(self, name: str, goal: tuple[float, float, float]) -> bool:
         """Same path as one Hybrid Start: chest PBVS until the fingertip arrives, then wrist IBVS."""
         self._goal_name = name
         self._locked_buttons = {name: goal}
@@ -4857,6 +5439,8 @@ class ArmMover:
             self._chest_height_hold = False
             self._forward_hold = False
             self._pbvs_once(telem)
+            if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                return False
             if self._control_stage == "WRIST_APPROACH":
                 break
             if self._control_stage == "HOLD" or self.phase in {
@@ -4903,6 +5487,8 @@ class ArmMover:
                 return True
             fresh = self.telemetry() or {}
             self._wrist_approach_once(fresh)
+            if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                return False
             if self.phase == "contact":
                 return True
             if self._control_stage == "HOLD":
@@ -4912,6 +5498,35 @@ class ArmMover:
         self.message = f"{name} 右腕进近未碰到按键"
         self.log(f"[ARM] {self.message}")
         return False
+
+    def _snapshot_right_joints(self) -> list[float] | None:
+        if self.controller is None:
+            return None
+        try:
+            measured = self.controller.measured_arm_rad("right")
+        except Exception:
+            return None
+        if not measured or len(measured) < 7:
+            return None
+        return [float(value) for value in measured[:7]]
+
+    def _restore_right_joints(self, q_rad: Sequence[float]) -> bool:
+        """Joint-space return. A failed press must not be the next press's start pose."""
+        if self._stop.is_set() or getattr(self.controller, "_aborted", False):
+            return False
+        if self.controller is None or q_rad is None or len(q_rad) < 7:
+            return False
+        apply = getattr(self.controller, "apply_arm_rad", None)
+        if not callable(apply):
+            return False
+        target = [float(value) for value in q_rad[:7]]
+        try:
+            apply("right", target, seconds=2.5, dt=MOTION_DT_S)
+        except Exception as exc:
+            self.log(f"[ARM] 回到动作前关节失败: {exc}")
+            return False
+        self._wait_until_tracked(target)
+        return True
 
     def _retreat_clear_of_panel(self, label: str) -> None:
         """Move down and right so the chest can see the faceplate again.
@@ -4923,24 +5538,8 @@ class ArmMover:
         self._sequence_stage = f"{label} 移开"
         self.message = f"{label} 移开：向下、向右离开面板"
         self.log(f"[ARM] {self.message}")
-        measured = None
-        if self.controller is not None:
-            try:
-                measured = self.controller.measured_arm_rad("right")
-            except Exception:
-                measured = None
-        tip_xyz = getattr(self.ik, "tip_xyz", None)
-        if not measured or not callable(tip_xyz):
-            self.message = f"{label} 移开失败：没有指尖坐标"
-            self.log(f"[ARM] {self.message}")
-            return
-        try:
-            tip = tuple(float(value) for value in tip_xyz(measured))
-        except Exception as exc:
-            self.message = f"{label} 移开失败：{exc}"
-            self.log(f"[ARM] {self.message}")
-            return
-        if len(tip) != 3 or not all(math.isfinite(value) for value in tip):
+        tip = self._measured_tip()
+        if tip is None:
             self.message = f"{label} 移开失败：没有指尖坐标"
             self.log(f"[ARM] {self.message}")
             return
@@ -4959,13 +5558,22 @@ class ArmMover:
         self.controller = None
         if self._motion_backend == "service":
             self._kill_service_now()
-        release = getattr(controller, "release", None) if controller is not None else None
-        if callable(release):
+        aborted = False
+        abort = getattr(controller, "abort", None) if controller is not None else None
+        if callable(abort):
             try:
-                release(seconds=1.2)
+                abort()
+                aborted = bool(getattr(controller, "_aborted", False))
             except Exception as exc:
                 self.log(f"[ARM] 松权失败: {exc}")
-        if self._motion_backend != "service":
+        if not aborted and controller is not None:
+            release = getattr(controller, "release", None)
+            if callable(release):
+                try:
+                    release(seconds=0.0)
+                except Exception as exc:
+                    self.log(f"[ARM] 松权失败: {exc}")
+        if self._motion_backend != "service" and not aborted:
             self._drop_sdk_hold()
         self._stop.set()
 
@@ -4988,6 +5596,7 @@ class ArmMover:
         self.phase = "released"
         self.message = "动作组合完成，右臂已放下，已释放控制"
         self.log(f"[ARM] {self.message}")
+        self._emit_task_end("done")
         self._drop_sequence_controller()
 
     def _run_direct_sequence_button(self, name: str, goal: tuple[float, float, float]) -> bool:
@@ -5016,6 +5625,70 @@ class ArmMover:
         self._screen_report = ""
         self._screen_history = []
 
+    def _format_xyz_mm(self, point: tuple[float, float, float] | None) -> str:
+        if point is None or len(point) != 3:
+            return "未读到"
+        try:
+            values = tuple(float(value) for value in point)
+        except (TypeError, ValueError):
+            return "未读到"
+        if not all(math.isfinite(value) for value in values):
+            return "未读到"
+        return " ".join(
+            f"{axis} {values[index] * 1000:.0f}" for index, axis in enumerate("XYZ")
+        ) + " mm"
+
+    def _begin_action_pose(self, label: str, goal: tuple[float, float, float] | None) -> None:
+        if self._action_pose_pending:
+            self._record_action_pose("未完成")
+        self._action_label = str(label or "动作")
+        parsed = None
+        if goal is not None and len(goal) == 3:
+            try:
+                parsed = tuple(float(value) for value in goal)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and not all(math.isfinite(value) for value in parsed):
+                parsed = None
+        self._action_goal = parsed
+        self._action_pose_pending = True
+
+    def _record_action_pose(self, outcome: str) -> None:
+        """Keep the fingertip and the button target when an action ends."""
+        if not self._action_pose_pending:
+            return
+        self._action_pose_pending = False
+        try:
+            tip = self._measured_tip()
+        except Exception:
+            tip = None
+        goal = self._action_goal or self._pose_target_xyz() or self._fresh_torso_target()
+        line = (
+            f"{self._action_label} {outcome}  "
+            f"到位 {self._format_xyz_mm(tip)}  目标 {self._format_xyz_mm(goal)}"
+        )
+        history = list(self._action_pose_history)
+        history.append(line)
+        self._action_pose_history = history[-12:]
+        self.log(f"[ARM] {line}")
+
+    def _retry_text(self, count: int) -> str:
+        return f"【重试】第{int(count)}次"
+
+    def _mark_retry(self, count: int) -> None:
+        """0 is the first try. A later count stays on the page until this try ends."""
+        self._retry_count = max(0, int(count))
+
+    def _message_for_page(self) -> str:
+        text = str(self.message or "")
+        count = int(getattr(self, "_retry_count", 0) or 0)
+        if count <= 0:
+            return text
+        banner = self._retry_text(count)
+        if banner in text:
+            return text
+        return f"{banner} {text}".strip()
+
     def _push_screen_line(self, line: str) -> None:
         self._screen_report = line
         history = list(self._screen_history)
@@ -5023,6 +5696,33 @@ class ArmMover:
         self._screen_history = history[-12:]
         self.message = line
         self.log(f"[ARM] {line}")
+
+    def _emit_screen_record(self, image, label: str, info: dict[str, Any] | None) -> None:
+        callback = self.on_screen_record
+        if not callable(callback):
+            return
+        try:
+            callback(image, label, None if info is None else dict(info))
+        except Exception as exc:
+            self.log(f"[ARM][WARN] 屏幕记录失败: {exc}")
+
+    def _emit_task_begin(self) -> None:
+        callback = self.on_task_begin
+        if not callable(callback):
+            return
+        try:
+            callback()
+        except Exception as exc:
+            self.log(f"[ARM][WARN] 任务记录失败: {exc}")
+
+    def _emit_task_end(self, reason: str) -> None:
+        callback = self.on_task_end
+        if not callable(callback):
+            return
+        try:
+            callback(reason)
+        except Exception as exc:
+            self.log(f"[ARM][WARN] 任务记录失败: {exc}")
 
     def _sleep_for_screen(self) -> None:
         remaining = max(0.0, float(self.screen_settle_s))
@@ -5073,6 +5773,7 @@ class ArmMover:
             image = image.copy()
         if image is None:
             self._push_screen_line(f"{label} 没有读到屏幕")
+            self._emit_screen_record(None, label, None)
             return None
         info = read_panel(image)
         self._screen_block = dict(info)
@@ -5081,6 +5782,7 @@ class ArmMover:
         previous_info = self._screen_before_info
         self._screen_before = image
         self._screen_before_info = dict(info)
+        self._emit_screen_record(image, label, info)
         if previous is None or previous_info is None:
             if label == "动作前":
                 self._push_screen_line(f"{label}。{desc}")
@@ -5099,15 +5801,17 @@ class ArmMover:
         if changed is True:
             return False
         if attempt + 1 >= SCREEN_PRESS_ATTEMPTS:
+            done = self._retry_text(attempt) if attempt else "这次"
             if changed is None:
-                self._push_screen_line(f"{label} 没有读到屏幕，停止")
+                self._push_screen_line(f"{label} 没有读到屏幕，{done}后仍失败，停止")
             else:
-                self._push_screen_line(f"{label} 屏幕仍无变化，停止")
+                self._push_screen_line(f"{label} 屏幕仍无变化，{done}后仍失败，停止")
             return True
+        nxt = attempt + 1
         if changed is None:
-            self._push_screen_line(f"{label} 没有读到屏幕，重新执行")
+            self._push_screen_line(f"{label} 没有读到屏幕，{self._retry_text(nxt)}")
         else:
-            self._push_screen_line(f"{label} 屏幕没有变化，重新执行")
+            self._push_screen_line(f"{label} 屏幕没有变化，{self._retry_text(nxt)}")
         return False
 
     def _hold_after_screen(self, *, arrived: bool) -> None:
@@ -5139,18 +5843,22 @@ class ArmMover:
         if self._return_ready.is_set() or self._stop.is_set():
             return
         attempt = 0
+        self._mark_retry(0)
         while True:
             if self._return_ready.is_set() or self._stop.is_set():
+                self._mark_retry(0)
                 return
+            self._mark_retry(attempt)
             goal = self._recognize_sequence_button(name)
             if goal is None:
                 self.phase = "direct_pbvs_rejected"
                 self.message = f"重新识别 {name} 失败，胸口没有看到该按键"
                 self.log(f"[ARM] {self.message}")
+                self._mark_retry(0)
                 self._hold_after_screen(arrived=False)
                 return
             kind = "Direct PBVS" if direct else "Hybrid"
-            self.message = f"{label} {kind}" if not attempt else f"{label} 第 {attempt + 1} 次，{kind}"
+            self.message = f"{label} {kind}" if not attempt else f"{self._retry_text(attempt)} {label} {kind}"
             self.log(f"[ARM] {self.message}")
             ran = (
                 self._run_direct_sequence_button(name, goal)
@@ -5158,23 +5866,32 @@ class ArmMover:
                 else self._run_hybrid_button(name, goal) 
             )
             if self._return_ready.is_set() or self._stop.is_set():
+                self._mark_retry(0)
                 return
             if not ran:
+                self._mark_retry(0)
                 self._hold_after_screen(arrived=False)
                 return
             self._retreat_clear_of_panel(label)
             if self._return_ready.is_set() or self._stop.is_set():
+                self._mark_retry(0)
                 return
             changed = self._read_progress_screen(label)
             if self._return_ready.is_set() or self._stop.is_set():
+                self._mark_retry(0)
                 return
             if changed is True:
+                self._mark_retry(0)
                 self._hold_after_screen(arrived=True)
                 return
             if self._screen_attempt_failed(label, changed, attempt):
+                self.message = f"{label} {self._retry_text(attempt)}后仍失败，停止"
+                self.log(f"[ARM] {self.message}")
+                self._mark_retry(0)
                 self._hold_after_screen(arrived=False)
                 return
             attempt += 1
+            self._mark_retry(attempt)
 
     def _run_button_sequence(self, start_index: int = 0) -> None:
         """Each button is Direct PBVS or Hybrid. Between buttons the arm clears down and right."""
@@ -5184,7 +5901,6 @@ class ArmMover:
         with self._sequence_lock:
             self._sequence_skip = 0
             self._sequence_inside = True
-        failed = False
         cleared = False
         try:
             if self._screen_progress and start_index <= 0:
@@ -5198,43 +5914,71 @@ class ArmMover:
                 if self._return_ready.is_set() or self._stop.is_set():
                     return
                 self._sequence_index = index
+                cleared = False
                 label = SEQUENCE_BUTTON_LABELS.get(name, name)
                 attempt = 0
+                goal_fixed = None
+                anchor = None
+                self._mark_retry(0)
                 try:
                     while True:
                         if self._return_ready.is_set() or self._stop.is_set():
                             return
+                        self._mark_retry(attempt)
                         if index > 0 and not cleared:
                             previous = SEQUENCE_BUTTON_LABELS.get(steps[index - 1], steps[index - 1])
                             self._retreat_clear_of_panel(previous)
                             if self._return_ready.is_set() or self._stop.is_set():
                                 return
-                        cleared = False
+                            cleared = True
+                            anchor = None
+                        if anchor is None:
+                            anchor = self._snapshot_right_joints()
+                        elif attempt:
+                            self._restore_right_joints(anchor)
+                        cleared = True
                         self._sequence_stage = f"{label} PBVS"
-                        self.message = f"{label} PBVS"
-                        goal = self._recognize_sequence_button(name)
+                        if goal_fixed is None:
+                            goal_fixed = self._recognize_sequence_button(name)
+                        goal = goal_fixed
+                        kind = "Direct PBVS" if direct else "Hybrid"
+                        self.message = f"动作 {index + 1}/{len(steps)} {name} {kind}"
+                        if attempt:
+                            self.message = f"{self._retry_text(attempt)} {label} {kind}"
+                        self.log(f"[ARM] {self.message}")
                         if goal is None:
                             self.phase = "direct_pbvs_rejected"
                             self.message = f"重新识别 {name} 失败，胸口没有看到该按键"
                             self.log(f"[ARM] {self.message}")
-                            failed = True
-                            break
-                        kind = "Direct PBVS" if direct else "Hybrid"
-                        self.message = f"动作 {index + 1}/{len(steps)} {name} {kind}"
-                        if attempt:
-                            self.message = f"{label} 第 {attempt + 1} 次，{kind}"
-                        self.log(f"[ARM] {self.message}")
-                        ran = (
-                            self._run_direct_sequence_button(name, goal)
-                            if direct
-                            else self._run_hybrid_button(name, goal)
-                        )
+                            ran = False
+                        else:
+                            ran = (
+                                self._run_direct_sequence_button(name, goal)
+                                if direct
+                                else self._run_hybrid_button(name, goal)
+                            )
                         if not ran:
-                            failed = True
-                            break
+                            if self._return_ready.is_set() or self._stop.is_set():
+                                return
+                            if attempt >= SEQUENCE_ACTION_RETRIES:
+                                self.message = (
+                                    f"{label} {self._retry_text(attempt)}后仍失败，进行下一步"
+                                )
+                                self.log(f"[ARM] {self.message}")
+                                self._mark_retry(0)
+                                self._restore_right_joints(anchor)
+                                break
+                            self._mark_retry(attempt + 1)
+                            self.message = f"{self._retry_text(attempt + 1)} {label} {kind}"
+                            self.log(f"[ARM] {self.message}")
+                            if self._return_ready.is_set() or self._stop.is_set():
+                                return
+                            attempt += 1
+                            continue
                         if self._return_ready.is_set() or self._stop.is_set():
                             return
                         if not self._screen_progress:
+                            self._mark_retry(0)
                             self.message = (
                                 f"Direct PBVS 完成，{name} 完成"
                                 if direct
@@ -5242,35 +5986,31 @@ class ArmMover:
                             )
                             self.log(f"[ARM] {self.message}")
                             break
-                        self._retreat_clear_of_panel(label)
-                        cleared = True
+                        self._restore_right_joints(anchor)
                         if self._return_ready.is_set() or self._stop.is_set():
                             return
                         changed = self._read_progress_screen(label)
                         if self._return_ready.is_set() or self._stop.is_set():
                             return
                         if changed is True:
+                            self._mark_retry(0)
                             break
                         if self._screen_attempt_failed(label, changed, attempt):
-                            failed = True
+                            self.message = f"{label} {self._retry_text(attempt)}后仍失败，进行下一步"
+                            self.log(f"[ARM] {self.message}")
+                            self._mark_retry(0)
                             break
+                        self._mark_retry(attempt + 1)
                         attempt += 1
                 except SequenceNext:
                     if index + 1 >= len(steps):
                         break
                     continue
-                if failed:
-                    break
             if self._return_ready.is_set() or self._stop.is_set():
-                return
-            if failed:
-                self._ibvs_enabled = False
-                self._running.clear()
-                self._control_stage = "HOLD"
-                self.log(f"[ARM] {self.message}")
                 return
             self._finish_sequence_and_release()
         finally:
+            self._mark_retry(0)
             with self._sequence_lock:
                 self._sequence_inside = False
                 self._sequence_skip = 0
@@ -5292,13 +6032,29 @@ class ArmMover:
                 return True
         return self._wrist_contact()
 
-    def _measured_tip(self) -> tuple[float, float, float] | None:
+    def _tool_xyz_measured(self) -> tuple[float, float, float] | None:
         measured = self.controller.measured_arm_rad("right") if self.controller is not None else None
-        tip_xyz = getattr(self.ik, "tip_xyz", None)
-        if not measured or not callable(tip_xyz):
+        if not measured:
             return None
         try:
-            current = tuple(float(value) for value in tip_xyz(measured))
+            point = self._tool_xyz(measured)
+        except Exception:
+            return None
+        if len(point) != 3 or not all(math.isfinite(value) for value in point):
+            return None
+        return point
+
+    def _measured_tip(self) -> tuple[float, float, float] | None:
+        if self.controller is None:
+            return None
+        try:
+            measured = self.controller.measured_arm_rad("right")
+        except Exception:
+            return None
+        if not measured:
+            return None
+        try:
+            current = self._tool_xyz(measured)
         except Exception:
             return None
         if len(current) != 3 or not all(math.isfinite(value) for value in current):
@@ -5352,7 +6108,7 @@ class ArmMover:
 
     def _direct_pbvs_via_service(self, goal: tuple[float, float, float]) -> None: # this function is used to move the arm to the button
         """Service Cartesian to the button. A low start rises before it advances."""
-        rpy = tuple(float(value) for value in DIRECT_EE_RPY_DEG)
+        rpy = tuple(float(value) for value in self._nominal_tool_rpy_deg())
         distance = self._tip_distance_to(goal)
         if distance is not None and distance > self.direct_pbvs_max_m:
             self._finish_direct_pbvs(
@@ -5365,12 +6121,17 @@ class ArmMover:
             self.phase = "direct_pbvs_rejected"
             return
         self.phase = "direct_pbvs"
+        tip = self._measured_tip()
+        hold = pbvs_yz_hold_goal(tip, goal) if PBVS_YZ_FIRST and tip is not None else None
+        first = hold if hold is not None else goal
         self.message = (
             f"Direct PBVS 服务 /h2_arm/singlearmcartesian "
-            f"XYZ {goal[0]:.3f} {goal[1]:.3f} {goal[2]:.3f}"
+            f"XYZ {first[0]:.3f} {first[1]:.3f} {first[2]:.3f}"
         )
         self.log(f"[ARM] {self.message}")
-        ok, detail = self._play_service_cartesian(self._measured_tip(), goal, rpy, "Direct PBVS")
+        ok, detail = self._play_service_cartesian(tip, first, rpy, "Direct PBVS")
+        if not ok and first is not goal:
+            ok, detail = self._play_service_cartesian(self._measured_tip(), goal, rpy, "Direct PBVS")
         if not ok:
             self._finish_direct_pbvs(False, f"Direct PBVS 服务失败：{detail}")
             self.phase = "direct_pbvs_rejected"
@@ -5380,8 +6141,10 @@ class ArmMover:
         time.sleep(0.35)
         follow = self._pose_target_xyz() or goal
         after = self._tip_distance_to(follow)
-        if after is not None and after <= DIRECT_PBVS_ARRIVE_TOL_M:
+        after_error = self._tip_error_to(follow)
+        if after_error is not None and direct_pbvs_arrived(after_error):
             note = f"{detail}；" if detail else ""
+            after = math.sqrt(sum(value * value for value in after_error))
             self._finish_direct_pbvs(True, f"{note}Direct PBVS 运控一次到位，剩余 {after*1000:.0f}mm")
             return
         if after is not None and after > self.direct_pbvs_max_m:
@@ -5408,12 +6171,29 @@ class ArmMover:
             return
         final = math.sqrt(sum(value * value for value in error))
         detail = f"X {error[0]*1000:.0f} Y {error[1]*1000:.0f} Z {error[2]*1000:.0f} mm"
-        if final <= DIRECT_PBVS_ARRIVE_TOL_M:
+        if direct_pbvs_arrived(error):
             self._finish_direct_pbvs(True, f"Direct PBVS 运控两段已执行，剩余 {final*1000:.0f}mm，{detail}")
             return
-        self._finish_direct_pbvs(False, f"Direct PBVS 运控两段已执行，还差 {detail}")
+        self._finish_direct_pbvs(False, f"Direct PBVS 运控两段已执行，未到位，还差 {detail}")
 
     def _direct_pbvs_once(self, telem: dict[str, Any], *, release: bool = True) -> None:
+        name = str(telem.get("target") or "")
+        label = SEQUENCE_BUTTON_LABELS.get(name, name or "Direct PBVS")
+        raw = telem.get("target_torso_m")
+        goal = None
+        if raw and len(raw) == 3:
+            try:
+                goal = tuple(float(value) for value in raw)
+            except (TypeError, ValueError):
+                goal = None
+        self._begin_action_pose(label, goal)
+        try:
+            self._direct_pbvs_run(telem, release=release)
+        finally:
+            if self._action_pose_pending:
+                self._record_action_pose("已释放" if self._stop.is_set() else "未到位")
+
+    def _direct_pbvs_run(self, telem: dict[str, Any], *, release: bool = True) -> None:
         """Move the measured fingertip onto the button, then correct gravity sag."""
         self._swing_right_arm_clear()
         self._pbvs_release = bool(release)
@@ -5437,15 +6217,8 @@ class ArmMover:
             self.phase = "direct_pbvs_rejected"
             self.message = "Direct PBVS 拒绝：没有右臂关节状态"
             return
-        tip_xyz = getattr(self.ik, "tip_xyz", None)
-        if not callable(tip_xyz):
-            self._ibvs_enabled = False
-            self._control_stage = "HOLD"
-            self.phase = "direct_pbvs_rejected"
-            self.message = "Direct PBVS 拒绝：FK 指尖模型不可用"
-            return
         try:
-            current_tip = tuple(float(value) for value in tip_xyz(measured))
+            current_tip = self._tool_xyz(measured)
         except Exception as exc:
             self._ibvs_enabled = False
             self._control_stage = "HOLD"
@@ -5453,6 +6226,7 @@ class ArmMover:
             self.message = f"Direct PBVS 拒绝：FK 指尖失败 {exc}"
             return
         goal = self._pose_target_xyz() or target
+        self._action_goal = tuple(float(value) for value in goal)
         solve_pose = getattr(self.ik, "apply_loaded_tool_pose_target", None)
         if not commanded or not callable(solve_pose):
             self._finish_direct_pbvs(False, "Direct PBVS 拒绝：运控末端 IK 未更新")
@@ -5473,22 +6247,14 @@ class ArmMover:
             return
         track_rad = 0.0
         for _round in range(DIRECT_PBVS_START_ROUNDS):
-            if self._wrist_contact():
-                self._finish_direct_pbvs(True, "右腕相机看到夹爪已碰到面板")
-                return
-            goal = self._pose_target_xyz() or goal
             error = tuple(goal[index] - current_tip[index] for index in range(3))
             round_start = math.sqrt(sum(value * value for value in error))
             for shot in range(DIRECT_PBVS_MAX_SHOTS):
                 if self._return_ready.is_set():
                     return
-                if self._wrist_contact():
-                    self._finish_direct_pbvs(True, "右腕相机看到夹爪已碰到面板")
-                    return
-                goal = self._pose_target_xyz() or goal
                 error = tuple(goal[index] - current_tip[index] for index in range(3))
                 distance = math.sqrt(sum(value * value for value in error))
-                if distance <= DIRECT_PBVS_ARRIVE_TOL_M:
+                if direct_pbvs_arrived(error):
                     self._finish_direct_pbvs(
                         True,
                         (
@@ -5497,21 +6263,99 @@ class ArmMover:
                         ),
                     )
                     return
+                if float(current_tip[0]) > float(goal[0]) + 1e-3:
+                    wall = (float(goal[0]) - float(current_tip[0]), error[1], error[2])
+                    if self._retract_if_deeper_than_button(wall, "DIRECT_PBVS", past_m=0.0):
+                        measured = self.controller.measured_arm_rad("right")
+                        commanded = self.controller.commanded_arm_rad("right") or measured
+                        q = commanded or measured
+                        if not q or not measured:
+                            break
+                        try:
+                            current_tip = self._tool_xyz(measured)
+                        except Exception:
+                            break
+                        continue
+                    self._finish_direct_pbvs(
+                        False,
+                        (
+                            "Direct PBVS 末端 X 已超过目标 "
+                            f"{(float(current_tip[0]) - float(goal[0])) * 1000:.0f}mm，停止前推"
+                        ),
+                    )
+                    return
                 self.message = (
                     f"Direct PBVS 第 {_round + 1} 轮 {shot + 1} 段，去按键，还差 "
                     f"X {error[0]*1000:.0f} Y {error[1]*1000:.0f} Z {error[2]*1000:.0f} mm"
                 )
-                if self._step_forward_if_aligned(error, "DIRECT_PBVS"):
+                yz_now = math.hypot(float(error[1]), float(error[2]))
+                goal_key = tuple(round(float(value), 3) for value in goal)
+                hold = pbvs_yz_hold_goal(current_tip, goal) if PBVS_YZ_FIRST else None
+                stalled = hold is not None and self._yz_attempt_stalled(goal_key, yz_now)
+                axis_moved = False
+                if hold is not None and not stalled and self._can_axis_step():
+                    step = pbvs_yz_align_step(error)
+                    if step is not None:
+                        self._apply_torso_delta(
+                            step,
+                            seconds=PBVS_STEP_SECONDS,
+                            phase="DIRECT_PBVS",
+                            limit_m=max(abs(float(value)) for value in step),
+                        )
+                        if not str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                            self._pbvs_yz_before = (goal_key, yz_now)
+                            self.message = self._yz_align_text(error, step)
+                            axis_moved = True
+                        elif self._sequence_run:
+                            self._finish_direct_pbvs(False, self.message)
+                            return
+                elif hold is None and self._can_axis_step() and self._step_forward_if_aligned(
+                    error, "DIRECT_PBVS"
+                ):
+                    self._pbvs_yz_before = None
+                    axis_moved = True
+                elif self._sequence_run and str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                    self._finish_direct_pbvs(False, self.message)
                     return
+                if axis_moved:
+                    measured = self.controller.measured_arm_rad("right")
+                    commanded = self.controller.commanded_arm_rad("right") or measured
+                    q = commanded or measured
+                    if not q or not measured:
+                        break
+                    try:
+                        current_tip = self._tool_xyz(measured)
+                    except Exception:
+                        break
+                    continue
+                # A failed YZ translation still aims the pose at button Y/Z with
+                # X held. Closing X is only the fallback if that pose cannot be solved.
+                plan_goal = goal if stalled or hold is None else hold
                 found = self._plan_cartesian_tool_move(
                     commanded,
                     measured,
                     current_tip,
-                    goal,
+                    plan_goal,
                     solve_pose,
                     must_move=True,
                     stage_limited=False,
                 )
+                if (found is None or not found["ok"]) and plan_goal is not goal:
+                    self._pbvs_yz_before = None
+                    found = self._plan_cartesian_tool_move(
+                        commanded,
+                        measured,
+                        current_tip,
+                        goal,
+                        solve_pose,
+                        must_move=True,
+                        stage_limited=False,
+                    )
+                    plan_goal = goal
+                elif found is not None and found["ok"] and plan_goal is not goal:
+                    self._pbvs_yz_before = (goal_key, yz_now)
+                else:
+                    self._pbvs_yz_before = None
                 if self._return_ready.is_set():
                     return
                 if found is None or not found["ok"]:
@@ -5525,36 +6369,60 @@ class ArmMover:
                     self.phase = "direct_pbvs_rejected"
                     return
                 self._last_visible_q = [float(value) for value in q]
+                shot_q = [float(value) for value in measured[:7]] if measured and len(measured) >= 7 else []
+                shot_distance = distance
                 self._play_cartesian_samples(found["samples"])
-                track_rad = self._wait_until_tracked(found["q"])
+                track_rad = self._hold_until_settled(found["q"])
                 commanded = self.controller.commanded_arm_rad("right")
                 measured = self.controller.measured_arm_rad("right")
                 q = commanded or measured
                 if not q or not measured:
                     break
                 try:
-                    current_tip = tuple(float(value) for value in tip_xyz(measured))
+                    current_tip = self._tool_xyz(measured)
                 except Exception:
                     break
-                if self._wrist_contact():
-                    self._finish_direct_pbvs(True, "右腕相机看到夹爪已碰到面板")
+                moved = tuple(goal[index] - current_tip[index] for index in range(3))
+                moved_distance = math.sqrt(sum(value * value for value in moved))
+                if self._stop.is_set() or getattr(self.controller, "_aborted", False):
+                    self._finish_direct_pbvs(False, "Direct PBVS 已释放，停在当前位置")
+                    return
+                if shot_q and (
+                    moved_distance > shot_distance + 0.03
+                    or float(current_tip[0]) > float(goal[0]) + 1e-3
+                ):
+                    self._restore_right_joints(shot_q)
+                    try:
+                        measured = self.controller.measured_arm_rad("right")
+                        current_tip = self._tool_xyz(measured)
+                    except Exception:
+                        pass
+                    self._finish_direct_pbvs(
+                        False,
+                        (
+                            "Direct PBVS 末端 X 不能超过目标，已回到动作前，还差 "
+                            f"X {error[0]*1000:.0f} Y {error[1]*1000:.0f} Z {error[2]*1000:.0f} mm"
+                        ),
+                    )
+                    return
+                if direct_pbvs_arrived(moved):
+                    self._finish_direct_pbvs(
+                        True,
+                        (
+                            f"Direct PBVS 实测到位，剩余 {moved_distance*1000:.0f}mm，"
+                            f"X {moved[0]*1000:.0f} Y {moved[1]*1000:.0f} Z {moved[2]*1000:.0f} mm"
+                        ),
+                    )
                     return
             if self._return_ready.is_set():
                 return
-            goal = self._pose_target_xyz() or goal
             error = tuple(goal[index] - current_tip[index] for index in range(3))
             distance = math.sqrt(sum(value * value for value in error))
-            if distance <= DIRECT_PBVS_ARRIVE_TOL_M or round_start - distance < 0.002:
+            if direct_pbvs_round_stalled(distance, round_start, track_rad):
                 break
-        if self._return_ready.is_set():
-            return
-        if self._wrist_contact():
-            self._finish_direct_pbvs(True, "右腕相机看到夹爪已碰到面板")
-            return
-        goal = self._pose_target_xyz() or goal
         error = tuple(goal[index] - current_tip[index] for index in range(3))
         distance = math.sqrt(sum(value * value for value in error))
-        if distance <= DIRECT_PBVS_ARRIVE_TOL_M:
+        if direct_pbvs_arrived(error):
             self._finish_direct_pbvs(
                 True,
                 (
@@ -5588,6 +6456,26 @@ class ArmMover:
         if len(measured) < len(target_rad):
             return math.pi
         return max(abs(float(after) - float(before)) for before, after in zip(measured, target_rad))
+
+    def _hold_until_settled(self, target_rad: Sequence[float]) -> float:
+        """Republish the final joints until the arm is within 1.5° or two seconds pass."""
+        error = self._wait_until_tracked(target_rad)
+        writer = getattr(self.controller, "write", None)
+        hold_fn = getattr(self.controller, "hold_positions", None)
+        if not callable(writer) or not callable(hold_fn):
+            return error
+        tight = math.radians(1.5)
+        deadline = time.monotonic() + 2.0
+        while error > tight and time.monotonic() < deadline:
+            if self._return_ready.is_set() or self._stop.is_set():
+                break
+            final = dict(hold_fn())
+            for joint, value in zip(RIGHT_ARM_JOINTS, target_rad):
+                final[joint] = float(value)
+            writer(final, weight=1.0)
+            time.sleep(0.05)
+            error = self._tracked_joint_error_rad(target_rad)
+        return error
 
     def _wait_until_tracked(self, target_rad: Sequence[float]) -> float:
         deadline = time.monotonic() + MOTION_TRACK_WAIT_S
@@ -5628,16 +6516,25 @@ class ArmMover:
 
     def _stream_arm_samples(self, samples: Sequence[Sequence[float]]) -> None:
         """Publish q and dq together. The 50 Hz hold keeps the latest dq until the next sample."""
+        if (
+            self._stop.is_set()
+            or self.controller is None
+            or getattr(self.controller, "_aborted", False)
+        ):
+            return
         hold = dict(self.controller.hold_positions())
         filtered = [0.0] * 7
         previous = None
         count = len(samples)
         for index, sample in enumerate(samples):
-            if self._return_ready.is_set():
+            if self._return_ready.is_set() or self._stop.is_set():
+                break
+            controller = self.controller
+            if controller is None or getattr(controller, "_aborted", False):
                 break
             # Coarse PBVS has to finish the raise. A wrist contact flag during
             # that move was leaving Z short of the measured button.
-            if self._control_stage != "PBVS_COARSE" and self._wrist_contact():
+            if self._control_stage not in {"PBVS_COARSE", "DIRECT_PBVS"} and self._wrist_contact():
                 break
             phase = index / (count - 1) if count > 1 else 1.0
             corrected = self._tracking_correction(sample, phase, filtered)
@@ -5648,14 +6545,17 @@ class ArmMover:
             if previous is not None:
                 for joint, prev, cur in zip(RIGHT_ARM_JOINTS, previous, corrected):
                     dq[joint] = (float(cur) - float(prev)) / MOTION_DT_S
-            self.controller.write(command, weight=1.0, dq=dq)
+            controller.write(command, weight=1.0, dq=dq)
             previous = list(corrected)
             time.sleep(MOTION_DT_S)
-        if samples:
+        if self._return_ready.is_set() or self._stop.is_set():
+            return
+        controller = self.controller
+        if samples and controller is not None and not getattr(controller, "_aborted", False):
             final = dict(hold)
             for joint, value in zip(RIGHT_ARM_JOINTS, samples[-1]):
                 final[joint] = float(value)
-            self.controller.write(final, weight=1.0)
+            controller.write(final, weight=1.0)
 
     def _play_joint_target(self, target_rad: Sequence[float], seconds: float) -> None:
         """One solved joint segment. Quintic timing, with dq, when the SDK can stream.
@@ -5775,12 +6675,18 @@ class ArmMover:
         # joint about 20° and the tip never moves, reported as a few millimetres.
         apply_tip = getattr(self.ik, "apply_tip_delta", None)
         if apply_tip is not None:
-            q_new, ok, pos_err, jump = apply_tip(q, torso, q)
+            try:
+                q_new, ok, pos_err, jump = apply_tip(
+                    q, torso, q, offset_m=tuple(self.tool_offset_wrist_m)
+                )
+            except TypeError:
+                q_new, ok, pos_err, jump = apply_tip(q, torso, q)
         else:
             q_new, ok, pos_err, jump = self.ik.apply_delta(q, torso)
         if not ok:
             self.message = (
-                f"IK 拒绝 pos={pos_err*1000:.1f}mm jump={math.degrees(float(jump)):.1f}deg"
+                f"IK 拒绝 这一步 {torso[0]*1000:.1f} {torso[1]*1000:.1f} {torso[2]*1000:.1f} mm，"
+                f"解算剩余 {pos_err*1000:.1f} mm，关节 {math.degrees(float(jump)):.1f}°"
             )
             return False
         shoulder_raised = float(q_new[0]) < float(q[0]) - math.radians(0.4)

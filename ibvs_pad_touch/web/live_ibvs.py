@@ -23,17 +23,20 @@ from ibvs_pad_touch.perception.yellow_buttons import (
     YELLOW_TRACK_MISS_FRAMES,
     detect_red_bar,
     match_yellow_blob,
+    nearest_long_yellow_bar,
     yellow_blob_at,
     yellow_blobs,
 )
 from ibvs_pad_touch.perception.yolo_touch import (
     YoloTouchDetector,
     apply_pose_buttons,
-    gripper_axis_tip,
     gripper_toward_panel_tip,
     keep_side_masks,
+    normalize_button_layout,
+    pose_finger_tip,
     pose_tip,
     tip_on_mask,
+    without_gripper,
 )
 from ibvs_pad_touch.perception.tip_tracker import StableTipTracker
 from ibvs_pad_touch.servo.controller import IBVSController
@@ -51,7 +54,7 @@ HANDEYE_CANDIDATES = (
     Path("/home/unitree/MscapeTech/Hand_Eye_Calib/artifacts/eye_in_hand/outputs"),
     Path(__file__).resolve().parents[3] / "Hand_Eye_Calib" / "artifacts" / "eye_in_hand" / "outputs",
 )
-EYE_IN_HAND_PREFERRED = "eye_in_hand_20261010_151507.json"
+EYE_IN_HAND_PREFERRED = "eye_in_hand_20261029_160039.json"
 EYE_TO_HAND_CANDIDATES = (
     Path("/home/unitree/MscapeTech/Hand_Eye_Calib/artifacts/eye_to_hand/outputs"),
     Path(__file__).resolve().parents[3] / "Hand_Eye_Calib" / "artifacts" / "eye_to_hand" / "outputs",
@@ -149,6 +152,21 @@ def discover_eye_in_hand_json() -> Optional[Path]:
     return max(found, key=lambda path: path.stat().st_mtime) if found else None
 
 
+def eye_in_hand_npy_dir(path: Path, data: dict[str, Any] | None = None) -> Path | None:
+    """Directory saved beside the wrist json, containing T_cam2hand.npy."""
+    recorded = ""
+    if isinstance(data, dict):
+        recorded = str(data.get("npy_dir") or "")
+    candidates = []
+    if recorded:
+        candidates.append(Path(recorded))
+    candidates.append(path.with_name(path.stem + "_npy"))
+    for candidate in candidates:
+        if (candidate / "T_cam2hand.npy").is_file():
+            return candidate
+    return None
+
+
 def load_eye_in_hand_transform(path: Path | None) -> tuple[np.ndarray | None, dict[str, Any]]:
     """cam2hand: a camera point maps into the right wrist frame. Runtime pose supplies the torso."""
     if path is None or not path.is_file():
@@ -160,6 +178,15 @@ def load_eye_in_hand_transform(path: Path | None) -> tuple[np.ndarray | None, di
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return None, {}
     method = str(data.get("calibration_method") or "")
+    npy_dir = eye_in_hand_npy_dir(path, data if isinstance(data, dict) else None)
+    npy_file = None if npy_dir is None else npy_dir / "T_cam2hand.npy"
+    if npy_file is not None:
+        try:
+            stored = np.load(npy_file)
+            if stored.shape == (4, 4) and np.all(np.isfinite(stored)):
+                transform = np.asarray(stored, dtype=np.float64)
+        except (OSError, ValueError):
+            npy_file = None
     if (method and method != "eye_in_hand") or not np.all(np.isfinite(transform)):
         return None, {}
     quality = data.get("quality") or {}
@@ -169,6 +196,8 @@ def load_eye_in_hand_transform(path: Path | None) -> tuple[np.ndarray | None, di
         return None, {}
     return transform, {
         "file": str(path),
+        "npy_dir": "" if npy_dir is None else str(npy_dir),
+        "npy_file": "" if npy_file is None else str(npy_file),
         "method": method or "eye_in_hand",
         "serial": serial,
         "hand_frame": hand,
@@ -496,29 +525,23 @@ def fresh_chest_pose(
     """
     if touch is None:
         return None
-    names: list[str] = []
-    if target_name in POSE_BUTTON_NAMES:
-        names.append(str(target_name))
-    names.extend(name for name in POSE_BUTTON_NAMES if name not in names)
-    image_uv: list[float] | None = None
-    torso: list[float] | None = None
+    # Only the selected key. Borrowing Button 3's depth while the name stays
+    # Button 1 sends the fingertip onto the OK key.
+    names = [str(target_name)] if target_name in POSE_BUTTON_NAMES else list(POSE_BUTTON_NAMES)
     for name in names:
         point = touch.point(name)
         if point is None or float(point.conf) < float(conf_min):
             continue
-        if image_uv is None:
-            image_uv = [round(float(point.u), 1), round(float(point.v), 1)]
-        if depth_m is None or K is None or torso is not None:
-            continue
-        z_m = sample_depth(depth_m, float(point.u), float(point.v), radius=6, percentile=20.0)
-        if z_m is None:
-            continue
-        xyz = K.backproject(float(point.u), float(point.v), float(z_m))
-        mapped = camera_xyz_to_torso(xyz, torso_T_camera=torso_T_camera)
-        torso = [round(float(value), 4) for value in mapped]
-    if image_uv is None:
-        return None
-    return {"uv": image_uv, "torso_m": torso}
+        image_uv = [round(float(point.u), 1), round(float(point.v), 1)]
+        torso = None
+        if depth_m is not None and K is not None:
+            z_m = sample_depth(depth_m, float(point.u), float(point.v), radius=6, percentile=20.0)
+            if z_m is not None:
+                xyz = K.backproject(float(point.u), float(point.v), float(z_m))
+                mapped = camera_xyz_to_torso(xyz, torso_T_camera=torso_T_camera)
+                torso = [round(float(value), 4) for value in mapped]
+        return {"uv": image_uv, "torso_m": torso}
+    return None
 
 
 def fresh_chest_pose_torso(
@@ -658,7 +681,12 @@ class LiveIbvsAnnotator:
         day: str = "20260920",
         use_yolo: bool = False,
         detector=None,
+        ignore_gripper: bool = False,
+        async_preview: bool = False,
     ) -> None:
+        self.ignore_gripper = bool(ignore_gripper)
+        if self.ignore_gripper:
+            print("[ibvs-yolo] revo2: FingerTip approach, ignore gripper and gripper_tip", flush=True)
         self.ctrl = IBVSController.from_configs()
         self.panel = load_panel()
         cam = __import__("ibvs_pad_touch.config", fromlist=["load_camera_config"]).load_camera_config()["camera"]
@@ -726,6 +754,7 @@ class LiveIbvsAnnotator:
         self._wrist_buttons_fresh = False
         self._wrist_red_bar = False
         self._wrist_close_range = False
+        self._wrist_target_source = ""
         self._wrist_yellow: dict[str, Any] | None = None
         self._wrist_yellow_id = 0
         self._wrist_yellow_message = ""
@@ -735,13 +764,23 @@ class LiveIbvsAnnotator:
         self._last_side_bgr: np.ndarray | None = None
         self._last_side_screen = None
         self._side_ready_fn = lambda: False
+        self._sdk_active = False
+        self._finger_lock: CameraPoint | None = None
+        self._finger_recapture = False
+        self._finger_lock_enabled = False
         self._stage_fn = lambda: ""
+        self._async_preview = bool(async_preview)
+        self._latest_frame: dict[str, np.ndarray] = {}
+        self._preview: dict[str, tuple] = {}
+        self._infer_guard = threading.Lock()
+        self._infer_event = threading.Event()
+        self._infer_started = False
         if detector is not None:
             self.detector = detector
             self.wrist_detector = detector
         elif use_yolo:
             self.detector = YoloTouchDetector(name="chest")
-            self.wrist_detector = YoloTouchDetector(name="wrist")
+            self.wrist_detector = YoloTouchDetector(name="wrist", cpu_pose=True)
             self.detector._ensure()
             self.wrist_detector._ensure()
         else:
@@ -860,7 +899,115 @@ class LiveIbvsAnnotator:
 
     def telemetry(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._telemetry)
+            payload = dict(self._telemetry)
+        payload.update(self.finger_tip_status())
+        return payload
+
+    def set_sdk_active(self, active: bool) -> None:
+        """Arm the fingertip latch only after arm_sdk is holding the body."""
+        with self._lock:
+            self._sdk_active = bool(active)
+
+    def recapture_finger_tip(self) -> str:
+        """Drop in the next wrist FingerTip. Task changes do not do this."""
+        if not self.ignore_gripper:
+            return "当前右手不是 Revo2，指尖不锁定"
+        with self._lock:
+            if not self._finger_lock_enabled:
+                return "指尖锁定是关的，正在用每帧检测"
+            self._finger_recapture = True
+        return "等待下一帧右腕 FingerTip，用来替换已锁定的指尖"
+
+    def toggle_finger_lock(self) -> str:
+        """Turn the fixed fingertip off, or arm it again for the next frame."""
+        if not self.ignore_gripper:
+            return "当前右手不是 Revo2，指尖不锁定"
+        with self._lock:
+            self._finger_lock_enabled = not self._finger_lock_enabled
+            enabled = self._finger_lock_enabled
+            if not enabled:
+                self._finger_lock = None
+                self._finger_recapture = False
+                return "指尖锁定已关闭，改用实时检测"
+            self._finger_recapture = True
+            return "指尖锁定已打开，等待下一帧"
+
+    def finger_tip_status(self) -> dict[str, Any]:
+        with self._lock:
+            locked = self._finger_lock
+            recapture = self._finger_recapture
+            enabled = self._finger_lock_enabled
+        if not self.ignore_gripper:
+            return {
+                "finger_tip_lock": None,
+                "finger_tip_recapture": False,
+                "finger_tip_lock_enabled": False,
+                "finger_tip_text": "",
+            }
+        if not enabled:
+            text = "指尖实时检测"
+        elif recapture:
+            text = "等待重新检测指尖"
+        elif locked is None:
+            text = "等待第一次指尖"
+        else:
+            depth = "" if locked.z_m is None else f" z {locked.z_m * 1000:.0f}mm"
+            text = f"指尖锁定 {locked.u:.0f},{locked.v:.0f}{depth}"
+        point = None
+        if locked is not None:
+            point = {
+                "u": round(float(locked.u), 1),
+                "v": round(float(locked.v), 1),
+                "z_m": None if locked.z_m is None else round(float(locked.z_m), 4),
+            }
+        return {
+            "finger_tip_lock": point,
+            "finger_tip_recapture": recapture,
+            "finger_tip_lock_enabled": enabled,
+            "finger_tip_text": text,
+        }
+
+    def _take_wrist_finger(self, live: CameraPoint | None) -> tuple[CameraPoint | None, CameraPoint | None]:
+        """Control tip, plus the live detection when it should still be drawn."""
+        if not self.ignore_gripper:
+            return live, None
+        with self._lock:
+            if not self._finger_lock_enabled:
+                return live, None
+            locked = self._finger_lock
+            recapture = self._finger_recapture
+        control, stored, pending = latch_wrist_finger_tip(
+            locked,
+            live,
+            recapture=recapture,
+        )
+        if stored is not None and stored.z_m is None:
+            filled = self._finger_depth_once(stored)
+            if filled is not None:
+                stored = filled
+                control = filled
+        with self._lock:
+            self._finger_lock = stored
+            self._finger_recapture = pending
+        return control, live
+
+    def _finger_depth_once(self, point: CameraPoint) -> CameraPoint | None:
+        """Freeze the first depth at the locked pixel. Later frames do not move it."""
+        depth = read_depth(SIDE_DEPTH_PATH)
+        if depth is None:
+            return None
+        z_m = sample_depth(depth, float(point.u), float(point.v), radius=6, percentile=20.0)
+        if z_m is None:
+            return None
+        frozen = point.with_depth(self.K, float(z_m))
+        return CameraPoint(
+            u=frozen.u,
+            v=frozen.v,
+            z_m=frozen.z_m,
+            xyz_m=frozen.xyz_m,
+            source="finger_lock",
+            confidence=frozen.confidence,
+        )
 
     def set_target(self, name: str) -> None:
         self.ctrl.set_target(name)
@@ -909,6 +1056,7 @@ class LiveIbvsAnnotator:
                 self._wrist_buttons_fresh = False
                 self._wrist_red_bar = False
                 self._wrist_close_range = False
+                self._wrist_target_source = ""
                 self._wrist_yellow = None
                 self._wrist_yellow_message = ""
 
@@ -925,6 +1073,7 @@ class LiveIbvsAnnotator:
             self._wrist_updated_at = 0.0
             self._wrist_buttons_fresh = False
             self._wrist_close_range = False
+            self._wrist_target_source = ""
 
     def wrist_pbvs_view(self) -> dict[str, Any]:
         with self._lock:
@@ -947,6 +1096,7 @@ class LiveIbvsAnnotator:
                 "buttons_fresh": bool(self._wrist_buttons_fresh),
                 "red_bar": bool(self._wrist_red_bar),
                 "close_range": bool(self._wrist_close_range),
+                "target_source": str(self._wrist_target_source or ""),
                 "yellow_lock": self._wrist_yellow is not None,
                 "yellow_id": 0 if self._wrist_yellow is None else int(self._wrist_yellow["id"]),
                 "yellow_uv": (
@@ -1090,12 +1240,22 @@ class LiveIbvsAnnotator:
                 xyz = self.K.backproject(float(point.u), float(point.v), float(z_m))
                 buttons[name] = [float(value) for value in xyz]
         tip_z = None
-        if depth is not None and tip is not None:
+        if tip is not None and tip.source == "finger_lock" and tip.z_m is not None:
+            tip_z = float(tip.z_m)
+        elif depth is not None and tip is not None:
             sampled_tip = sample_depth(depth, float(tip.u), float(tip.v), radius=6, percentile=20.0)
             if sampled_tip is not None:
                 tip_z = float(sampled_tip)
         red_bar = detect_red_bar(bgr)
         self._refresh_wrist_yellow(bgr)
+        image_target = None if touch is None else touch.point(self.ctrl.target_name)
+        image_ok = (
+            image_target is not None
+            and float(image_target.conf) >= self._wrist_button_conf()
+        )
+        yellow_uv = None
+        if not image_ok and tip is not None:
+            yellow_uv = nearest_long_yellow_bar(bgr, (float(tip.u), float(tip.v)))
         with self._lock:
             if screen is not None:
                 self._last_side_bgr = bgr.copy()
@@ -1105,13 +1265,9 @@ class LiveIbvsAnnotator:
                 # The wrist camera only ever sees part of the panel, and the jaw
                 # is in frame. That is not a reason to drop this sample.
                 self._wrist_occluded = False
-            image_target = None if touch is None else touch.point(self.ctrl.target_name)
             target_name = self.ctrl.target_name
-            image_ok = (
-                image_target is not None
-                and float(image_target.conf) >= self._wrist_button_conf()
-            )
             target_has_depth = bool(image_ok and target_name in buttons)
+            self._wrist_target_source = ""
             # A confident button with no depth is already inside the camera's
             # minimum range, about 5 cm. Keep the pixels and do not invent Z.
             close_range = bool(watching and image_ok and tip is not None and not target_has_depth)
@@ -1123,6 +1279,7 @@ class LiveIbvsAnnotator:
             if watching and target_has_depth:
                 self._wrist_buttons_fresh = True
                 self._wrist_close_range = False
+                self._wrist_target_source = "button"
                 self._wrist_target_uv = [float(image_target.u), float(image_target.v)]
                 self._wrist_target_z = float(buttons[target_name][2])
                 self._wrist_tip_uv = None if tip is None else [float(tip.u), float(tip.v)]
@@ -1132,12 +1289,34 @@ class LiveIbvsAnnotator:
                 self._wrist_buttons_fresh = False
                 self._wrist_close_range = True
                 self._wrist_seen = True
+                self._wrist_target_source = "button"
                 self._wrist_buttons_cam.pop(target_name, None)
                 self._wrist_target_uv = [float(image_target.u), float(image_target.v)]
                 self._wrist_target_z = None
                 self._wrist_tip_uv = [float(tip.u), float(tip.v)]
                 self._wrist_tip_z = None
                 self._wrist_updated_at = time.time()
+            elif watching and yellow_uv is not None and tip is not None:
+                yu, yv = yellow_uv
+                yellow_z = None
+                if depth is not None:
+                    sampled = sample_depth(depth, yu, yv, radius=6, percentile=20.0)
+                    if sampled is not None:
+                        yellow_z = float(sampled)
+                self._wrist_target_uv = [yu, yv]
+                self._wrist_tip_uv = [float(tip.u), float(tip.v)]
+                self._wrist_tip_z = tip_z
+                self._wrist_seen = True
+                self._wrist_target_source = "yellow_bar"
+                self._wrist_updated_at = time.time()
+                if yellow_z is not None:
+                    self._wrist_target_z = yellow_z
+                    self._wrist_buttons_fresh = True
+                    self._wrist_close_range = False
+                else:
+                    self._wrist_target_z = None
+                    self._wrist_buttons_fresh = False
+                    self._wrist_close_range = True
             elif watching and buttons:
                 self._wrist_buttons_fresh = True
                 self._wrist_close_range = False
@@ -1167,10 +1346,12 @@ class LiveIbvsAnnotator:
                     self._wrist_target_z = yellow_z
                     self._wrist_buttons_fresh = True
                     self._wrist_close_range = False
+                    self._wrist_target_source = "yellow_lock"
                 elif tip is not None:
                     self._wrist_target_z = None
                     self._wrist_buttons_fresh = False
                     self._wrist_close_range = True
+                    self._wrist_target_source = "yellow_lock"
                 else:
                     self._wrist_target_z = None
                     self._wrist_buttons_fresh = False
@@ -1222,21 +1403,48 @@ class LiveIbvsAnnotator:
         )
 
     def _paint_side(self, bgr: np.ndarray, touch):
-        """Draw the partial panel, the jaw, and every detected button."""
-        masks = keep_side_masks([] if touch is None else touch.masks)
-        vis = draw_seg_masks(bgr, masks)
-        seg_corners = _seg_panel_corners(touch, bgr.shape, self._point_conf())
-        gripper = next((mask for mask in masks if mask.name == "gripper"), None)
-        tip = pose_tip(touch, self._point_conf())
-        if tip is not None and not tip_on_mask(tip, gripper):
-            tip = None
-        if tip is None and gripper is not None:
-            tip = gripper_axis_tip(gripper)
+        """Draw the fingertip and the pose buttons. The wrist does not use segmentation."""
+        vis = bgr
+        seg_corners = None
+        live_finger = None
+        if self.ignore_gripper:
+            live_finger = pose_finger_tip(touch, self._point_conf())
+            if live_finger is None:
+                live_finger = pose_finger_tip(touch, 0.15)
+            tip, live_finger = self._take_wrist_finger(live_finger)
+        else:
+            tip = pose_tip(touch, self._point_conf())
+        if (
+            live_finger is not None
+            and tip is not None
+            and math.hypot(float(live_finger.u) - float(tip.u), float(live_finger.v) - float(tip.v)) > 8.0
+        ):
+            if vis is bgr:
+                vis = bgr.copy()
+            seen = (int(round(live_finger.u)), int(round(live_finger.v)))
+            cv2.circle(vis, seen, 6, (160, 160, 160), 1, cv2.LINE_AA)
+            cv2.putText(
+                vis,
+                "NEW",
+                (seen[0] + 8, max(16, seen[1] - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (160, 160, 160),
+                1,
+                cv2.LINE_AA,
+            )
         if tip is not None:
             if vis is bgr:
                 vis = bgr.copy()
             px = (int(round(tip.u)), int(round(tip.v)))
-            label = "AXIS" if tip.source == "axis" else "TIP"
+            if tip.source == "finger_lock":
+                label = "LOCK"
+            elif tip.source == "finger":
+                label = "FINGER"
+            elif tip.source == "axis":
+                label = "AXIS"
+            else:
+                label = "TIP"
             cv2.drawMarker(vis, px, (0, 255, 255), cv2.MARKER_TILTED_CROSS, 18, 2)
             cv2.putText(
                 vis,
@@ -1268,10 +1476,18 @@ class LiveIbvsAnnotator:
             return None
         now = time.monotonic()
         cached = self._touch_cache.get(key)
-        if cached is not None and now - float(cached[0]) < 0.20:
+        # The wrist pose is one network. Do not keep a stale fingertip while
+        # the chest segmentation is still using the GPU.
+        limit = 0.05 if key == "wrist" else 0.20
+        if cached is not None and now - float(cached[0]) < limit:
             return cached[1]
         try:
-            result = detector.predict(bgr)
+            if key == "wrist":
+                result = normalize_button_layout(detector.predict(bgr, pose_only=True))
+            else:
+                result = normalize_button_layout(detector.predict(bgr))
+            if self.ignore_gripper:
+                result = without_gripper(result)
         except Exception as exc:
             if key not in self._yolo_warned:
                 print(f"[ibvs-yolo] {key} {exc}", flush=True)
@@ -1281,16 +1497,152 @@ class LiveIbvsAnnotator:
         return result
 
     def annotate(self, name: str, frame: np.ndarray) -> np.ndarray:
+        if self._async_preview and name in {"chest", "d435i"}:
+            with self._infer_guard:
+                self._latest_frame[name] = frame.copy()
+                self._infer_event.set()
+                if not self._infer_started:
+                    self._infer_started = True
+                    threading.Thread(
+                        target=self._infer_loop, args=("chest",), name="ibvs-chest", daemon=True
+                    ).start()
+                    threading.Thread(
+                        target=self._infer_loop, args=("d435i",), name="ibvs-wrist", daemon=True
+                    ).start()
+            return self._preview_frame(name, frame)
         if name == "chest":
             return self._annotate_chest(frame)
         if name == "d435i":
             return self._annotate_right_wrist(frame)
         return frame
 
+    def _infer_loop(self, camera: str) -> None:
+        """One thread per camera. The wrist pose must not wait for chest segmentation."""
+        while True:
+            self._infer_event.wait(0.02)
+            with self._infer_guard:
+                frame = self._latest_frame.pop(camera, None)
+                if not self._latest_frame:
+                    self._infer_event.clear()
+            if frame is None:
+                continue
+            try:
+                if camera == "chest":
+                    self._annotate_chest(frame)
+                elif camera == "d435i":
+                    self._annotate_right_wrist(frame)
+            except Exception as exc:
+                print(f"[ibvs-yolo] {camera} {exc}", flush=True)
+
+    def _stash_view(self, name: str, payload) -> None:
+        with self._infer_guard:
+            self._preview[name] = payload
+
+    def _preview_frame(self, name: str, bgr: np.ndarray) -> np.ndarray:
+        with self._infer_guard:
+            pack = self._preview.get(name)
+        if not pack:
+            return bgr
+        if pack[0] == "chest":
+            return self._paint_chest_view(bgr, pack)
+        if pack[0] == "wrist":
+            return self._paint_wrist_view(bgr, pack)
+        return bgr
+
+    def _paint_chest_view(self, bgr: np.ndarray, pack) -> np.ndarray:
+        """Same panel fill, screen contour, and colored button labels as the full overlay."""
+        _kind, loc, touch, lines, model_lines = pack
+        vis = bgr
+        if loc.corners_px or loc.buttons:
+            vis = draw_localization(bgr, loc)
+        vis = draw_pose_buttons(
+            vis,
+            {} if touch is None else touch.points,
+            skip={name: (point.u, point.v) for name, point in loc.buttons.items()},
+        )
+        regions = [
+            mask
+            for mask in keep_side_masks([] if touch is None else touch.masks, gripper_min=0.3)
+            if mask.name != "panel"
+        ]
+        if regions:
+            vis = draw_seg_masks(vis, regions)
+        if lines:
+            vis = _hud(vis, list(lines), max_width=int(0.52 * vis.shape[1]))
+        if model_lines:
+            vis = _hud(
+                vis,
+                list(model_lines),
+                origin=(int(0.56 * vis.shape[1]), 8),
+                max_width=int(0.42 * vis.shape[1]),
+            )
+        return vis
+
+    def _paint_wrist_view(self, bgr: np.ndarray, pack) -> np.ndarray:
+        _kind, touch, tip, yellow, lines, model_lines, red_bar = pack
+        vis = bgr
+        vis = draw_pose_buttons(
+            vis,
+            {} if touch is None else touch.points,
+            conf_min=self._wrist_button_conf(),
+        )
+        if tip is not None:
+            if vis is bgr:
+                vis = bgr.copy()
+            px = (int(round(tip[0])), int(round(tip[1])))
+            cv2.drawMarker(vis, px, (0, 255, 255), cv2.MARKER_TILTED_CROSS, 18, 2)
+            cv2.putText(
+                vis,
+                tip[2],
+                (px[0] + 8, max(16, px[1] - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        if yellow is not None:
+            if vis is bgr:
+                vis = bgr.copy()
+            mark = (int(round(yellow[0])), int(round(yellow[1])))
+            cv2.circle(vis, mark, 16, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.drawMarker(vis, mark, (0, 255, 255), cv2.MARKER_CROSS, 22, 2, cv2.LINE_AA)
+            cv2.putText(
+                vis,
+                "YELLOW",
+                (mark[0] + 12, max(16, mark[1] - 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        if red_bar:
+            if vis is bgr:
+                vis = bgr.copy()
+            cv2.putText(
+                vis,
+                "RED",
+                (8, max(18, vis.shape[0] - 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        if lines:
+            vis = _hud(vis, list(lines), max_width=int(0.52 * vis.shape[1]))
+        if model_lines:
+            vis = _hud(
+                vis,
+                list(model_lines),
+                origin=(int(0.56 * vis.shape[1]), 8),
+                max_width=int(0.42 * vis.shape[1]),
+            )
+        return vis
+
     def _annotate_chest(self, bgr: np.ndarray) -> np.ndarray:
         now = time.monotonic()
-        if now - self._last_chest_ts < 0.07 and self._last_chest_vis is not None:
-            return self._last_chest_vis
         self._last_chest_ts = now
         depth_m = read_depth(CHEST_DEPTH_PATH)
         if depth_m is not None and depth_m.shape[:2] != bgr.shape[:2]:
@@ -1337,7 +1689,12 @@ class LiveIbvsAnnotator:
             if pose_frozen
             else None
         )
-        raw_tip = _chest_raw_tip(touch, loc.corners_px, self._point_conf())
+        raw_tip = _chest_raw_tip(
+            touch,
+            loc.corners_px,
+            self._point_conf(),
+            finger=self.ignore_gripper,
+        )
         tracked = self.tip_tracker.update(bgr, raw_tip)
         tracker = self.tip_tracker.status()
         virtual = self._virtual_tip(apply_bias=True)
@@ -1600,6 +1957,10 @@ class LiveIbvsAnnotator:
             origin=(int(0.56 * vis.shape[1]), 8),
             max_width=int(0.42 * vis.shape[1]),
         )
+        self._stash_view(
+            "chest",
+            ("chest", loc, touch, tuple(lines), tuple(_model_status_lines(touch))),
+        )
         self._last_chest_vis = vis
         return vis
 
@@ -1630,10 +1991,11 @@ class LiveIbvsAnnotator:
                 self._wrist_contact_since,
                 now,
             )
+            tip_name = "指尖" if self.ignore_gripper else "夹爪尖"
             if tip_uv is None:
-                message = "右腕已看到按键，还没看到夹爪尖"
+                message = f"右腕已看到按键，还没看到{tip_name}"
             elif pressed and confirmed:
-                message = "右腕相机：夹爪已碰到面板"
+                message = f"右腕相机：{tip_name}已碰到面板"
             elif pressed:
                 message = "右腕接触确认中"
             elif pixel_contact and depth_gap_m is not None:
@@ -1689,8 +2051,6 @@ class LiveIbvsAnnotator:
     def _annotate_right_wrist(self, bgr: np.ndarray) -> np.ndarray:
         """Right-wrist Eye-in-Hand view used for close PBVS and contact."""
         now = time.monotonic()
-        if now - self._last_wrist_ts < 0.07 and self._last_wrist_vis is not None:
-            return self._last_wrist_vis
         self._last_wrist_ts = now
         self._last_wrist_bgr = bgr.copy()
         try:
@@ -1775,15 +2135,19 @@ class LiveIbvsAnnotator:
                     "left_updated_at": time.time(),
                 }
             unarmed_lines = [wrist_message]
+            finger_text = self.finger_tip_status().get("finger_tip_text") or ""
+            if finger_text:
+                unarmed_lines.append(finger_text)
             if yellow_message:
                 unarmed_lines.append(yellow_message)
             vis = _hud(vis, unarmed_lines, max_width=int(0.52 * vis.shape[1]))
             vis = _hud(
                 vis,
-                _model_status_lines(touch),
+                _model_status_lines(touch, seg=False),
                 origin=(int(0.56 * vis.shape[1]), 8),
                 max_width=int(0.42 * vis.shape[1]),
             )
+            self._stash_wrist_preview(seg_corners, tip, wrist_buttons, yellow, unarmed_lines, touch)
             self._last_wrist_vis = vis
             return vis
         side_depth = read_depth(SIDE_DEPTH_PATH)
@@ -1852,15 +2216,82 @@ class LiveIbvsAnnotator:
         ]
         if yellow_message:
             lines.append(yellow_message)
+        finger_text = self.finger_tip_status().get("finger_tip_text") or ""
+        if finger_text:
+            lines.append(finger_text)
         vis = _hud(vis, lines, max_width=int(0.52 * vis.shape[1]))
         vis = _hud(
             vis,
-            _model_status_lines(touch),
+            _model_status_lines(touch, seg=False),
             origin=(int(0.56 * vis.shape[1]), 8),
             max_width=int(0.42 * vis.shape[1]),
         )
+        self._stash_wrist_preview(seg_corners, tip, wrist_buttons, yellow, lines, touch)
         self._last_wrist_vis = vis
         return vis
+
+    def _stash_wrist_preview(self, seg_corners, tip, wrist_buttons, yellow, lines, touch) -> None:
+        del seg_corners, wrist_buttons
+        if tip is None:
+            tip_mark = None
+        elif getattr(tip, "source", "") == "finger_lock":
+            tip_mark = (float(tip.u), float(tip.v), "LOCK")
+        elif getattr(tip, "source", "") == "finger":
+            tip_mark = (float(tip.u), float(tip.v), "FINGER")
+        elif getattr(tip, "source", "") == "axis":
+            tip_mark = (float(tip.u), float(tip.v), "AXIS")
+        else:
+            tip_mark = (float(tip.u), float(tip.v), "TIP")
+        yellow_mark = None if yellow is None else (float(yellow["u"]), float(yellow["v"]))
+        self._stash_view(
+            "d435i",
+            (
+                "wrist",
+                touch,
+                tip_mark,
+                yellow_mark,
+                tuple(str(line) for line in lines if line),
+                tuple(_model_status_lines(touch, seg=False)),
+                bool(self._wrist_red_bar),
+            ),
+        )
+
+
+def latch_wrist_finger_tip(
+    locked: CameraPoint | None,
+    live: CameraPoint | None,
+    *,
+    recapture: bool,
+) -> tuple[CameraPoint | None, CameraPoint | None, bool]:
+    """Keep one wrist FingerTip only while the operator has turned locking on.
+
+    The camera and the hand move relative to each other, so the default is
+    live detection. Returns (tip used for approach, stored lock, recapture
+    still waiting).
+    """
+    if recapture:
+        if live is None:
+            return locked, locked, True
+        stored = _copy_finger_tip(live)
+        return stored, stored, False
+    if locked is None and live is not None:
+        stored = _copy_finger_tip(live)
+        return stored, stored, False
+    if locked is not None:
+        return locked, locked, False
+    return live, None, False
+
+
+def _copy_finger_tip(point: CameraPoint) -> CameraPoint:
+    xyz = None if point.xyz_m is None else tuple(float(value) for value in point.xyz_m)
+    return CameraPoint(
+        u=float(point.u),
+        v=float(point.v),
+        z_m=None if point.z_m is None else float(point.z_m),
+        xyz_m=xyz,
+        source="finger_lock",
+        confidence=float(point.confidence),
+    )
 
 
 def _pbvs_tip_observation(visual, depth_m, K, virtual_xyz):
@@ -1918,23 +2349,33 @@ def _side_status(touch, seg_corners, tip) -> str:
     return "side " + (" ".join(parts) if parts else "no gripper")
 
 
-def _model_status_lines(touch) -> list[str]:
+def _model_status_lines(touch, *, seg: bool = True) -> list[str]:
     """Keep segmentation and pose diagnostics in their own top-right panel."""
     if touch is None:
+        if not seg:
+            return ["POSE unavailable"]
         return ["SEG unavailable", "POSE unavailable"]
     best_masks: dict[str, float] = {}
     for mask in touch.masks:
         best_masks[mask.name] = max(best_masks.get(mask.name, 0.0), float(mask.conf))
     if touch.panel_corners:
         best_masks["panel"] = max(best_masks.get("panel", 0.0), float(touch.panel_conf))
-    seg = " ".join(f"{name}:{best_masks[name]:.2f}" for name in ("panel", "gripper", "screen") if name in best_masks)
-    pose_names = {"gripper_tip": "tip", "button_1": "b1", "button_2": "b2", "button_3": "b3"}
+    seg_text = " ".join(f"{name}:{best_masks[name]:.2f}" for name in ("panel", "gripper", "screen") if name in best_masks)
+    pose_names = {
+        "gripper_tip": "tip",
+        "button_1": "b1",
+        "button_2": "b2",
+        "button_3": "b3",
+        "FingerTip": "finger",
+    }
     pose = " ".join(
         f"{pose_names[name]}:{float(point.conf):.2f}"
         for name, point in touch.points.items()
         if name in pose_names
     )
-    return [f"SEG {seg or 'none'}", f"POSE {pose or 'none'}"]
+    if not seg:
+        return [f"POSE {pose or 'none'}"]
+    return [f"SEG {seg_text or 'none'}", f"POSE {pose or 'none'}"]
 
 
 def _chest_gripper_uv(touch) -> list[float] | None:
@@ -1978,14 +2419,21 @@ def _seg_panel_corners(touch, shape, conf_min: float):
     return [(float(x), float(y)) for x, y in quad]
 
 
-def _chest_raw_tip(touch, panel_corners, conf_min: float):
+def _chest_raw_tip(touch, panel_corners, conf_min: float, finger: bool = False):
     """Tip is the trained pose keypoint. The gripper region is the seg mask.
+
+    Revo2 uses FingerTip and does not fall back to the Dex1 jaw mask.
 
     A pose point that lands on the buttons while the jaw mask is somewhere
     else is not the tip; use the mask edge that faces the panel. When the
     mask is missing this frame, the pose keypoint still stands. Color is not
     a tip.
     """
+    if finger:
+        tip = pose_finger_tip(touch, conf_min)
+        if tip is None:
+            tip = pose_finger_tip(touch, 0.15)
+        return tip
     gripper = next(
         (mask for mask in keep_side_masks([] if touch is None else touch.masks, gripper_min=0.3) if mask.name == "gripper"),
         None,
@@ -2013,7 +2461,7 @@ def _on_panel_border(point, panel_corners, limit_px: float = 40.0) -> bool:
 
 def _chest_visual_tip(raw, tracked, manual: bool, panel_corners) -> CameraPoint | None:
     """Real image tip only. FK stays on the overlay and never closes the loop."""
-    if raw is not None and getattr(raw, "source", "") in {"pose", "axis", "face"}:
+    if raw is not None and getattr(raw, "source", "") in {"pose", "finger", "axis", "face"}:
         return raw
     chosen = None
     source = ""
@@ -2059,6 +2507,10 @@ _PREVIEW_EXACT = {
     "侧视未抬起，不检测夹爪": "side idle until Raise; gripper search off",
     "右腕已看到按键，还没看到夹爪尖": "wrist: button seen, tip missing",
     "右腕相机还没看到按键": "wrist: button not in view",
+    "指尖实时检测": "finger live",
+    "指尖锁定是关的，正在用每帧检测": "finger live",
+    "等待重新检测指尖": "waiting for next fingertip",
+    "等待第一次指尖": "waiting for fingertip",
     "右腕相机：夹爪已碰到面板": "wrist: jaw on the button",
     "右腕接触确认中": "wrist: confirming contact",
 }

@@ -4,13 +4,19 @@ import cv2
 import numpy as np
 
 from ibvs_pad_touch.perception.overlay import draw_pose_buttons
-from ibvs_pad_touch.perception.yellow_buttons import YELLOW_TRACK_MISS_FRAMES, detect_red_bar, yellow_blob_at
+from ibvs_pad_touch.perception.yellow_buttons import (
+    YELLOW_TRACK_MISS_FRAMES,
+    detect_red_bar,
+    nearest_long_yellow_bar,
+    yellow_blob_at,
+)
 from ibvs_pad_touch.perception.tip_tracker import StableTipTracker
 from ibvs_pad_touch.perception.yolo_touch import YoloMask, YoloPoint, YoloTouch
 from ibvs_pad_touch.types import CameraPoint, Intrinsics
 from ibvs_pad_touch.types import Localization
 from ibvs_pad_touch.web.live_ibvs import (
     LiveIbvsAnnotator,
+    latch_wrist_finger_tip,
     fresh_chest_pose,
     fresh_chest_pose_torso,
     _debounce_side_contact,
@@ -51,8 +57,23 @@ def test_fresh_chest_pose_uses_the_button_seen_this_frame():
         target_name="button_1",
         conf_min=0.3,
     )
-    assert seen is not None and other is not None
-    assert seen[2] != other[2]
+    assert seen is not None
+    assert other is None
+    borrowed = fresh_chest_pose(
+        YoloTouch(
+            points={
+                "button_1": YoloPoint("button_1", -20.0, -20.0, 0.9),
+                "button_3": YoloPoint("button_3", 10.0, 20.0, 0.9),
+            }
+        ),
+        depth,
+        K,
+        None,
+        target_name="button_1",
+    )
+    assert borrowed is not None
+    assert borrowed["uv"] == [-20.0, -20.0]
+    assert borrowed["torso_m"] is None
     assert fresh_chest_pose_torso(
         YoloTouch(points={"button_1": YoloPoint("button_1", 10.0, 10.0, 0.1)}),
         depth,
@@ -489,11 +510,11 @@ def test_preview_line_does_not_turn_chinese_into_question_marks():
     assert _preview_line("侧视伺服 间隙 36px") == "side IBVS gap 36px"
 
 
-def test_side_view_draws_gripper_mask_when_the_panel_is_absent():
+def test_side_view_does_not_draw_seg_masks():
     from ibvs_pad_touch.perception.yolo_touch import YoloMask, YoloPoint, YoloTouch
 
     class _GripperOnly:
-        def predict(self, bgr):
+        def predict(self, bgr, **_kwargs):
             return YoloTouch(
                 masks=[
                     YoloMask(
@@ -510,14 +531,14 @@ def test_side_view_draws_gripper_mask_when_the_panel_is_absent():
     out = annotator.annotate("d435i", frame)
     assert annotator.telemetry()["side_measured"] is False
     assert annotator.telemetry()["left_contact"] is False
-    assert int(out.sum()) != int(frame.sum())
+    assert int(out[120, 450].max()) == 240
 
 
 def test_side_view_does_not_place_buttons():
     from ibvs_pad_touch.perception.yolo_touch import YoloPoint, YoloTouch
 
     class _PanelAndButtons:
-        def predict(self, bgr):
+        def predict(self, bgr, **_kwargs):
             return YoloTouch(
                 panel_corners=[(120.0, 140.0), (500.0, 150.0), (490.0, 320.0), (130.0, 310.0)],
                 panel_conf=0.9,
@@ -538,7 +559,7 @@ def test_side_view_draws_yolo_before_raise_without_contact():
     from ibvs_pad_touch.perception.yolo_touch import YoloPoint, YoloTouch
 
     class _SideYolo:
-        def predict(self, bgr):
+        def predict(self, bgr, **_kwargs):
             return YoloTouch(
                 panel_corners=[(120.0, 140.0), (500.0, 150.0), (490.0, 320.0), (130.0, 310.0)],
                 panel_conf=0.9,
@@ -550,7 +571,7 @@ def test_side_view_draws_yolo_before_raise_without_contact():
     out = annotator.annotate("d435i", frame)
     assert annotator.telemetry()["side_measured"] is False
     assert annotator.telemetry()["left_contact"] is False
-    assert annotator.telemetry()["wrist_panel_visible"] is True
+    assert annotator.telemetry()["wrist_panel_visible"] is False
     assert int(out.sum()) != int(frame.sum())
 
 
@@ -591,9 +612,11 @@ def test_discover_handeye_returns_path_or_none():
 def test_preferred_right_wrist_eye_in_hand_is_loaded():
     path = discover_eye_in_hand_json()
     assert path is not None
-    assert path.name == "eye_in_hand_20261010_151507.json"
+    assert path.name == "eye_in_hand_20261029_160039.json"
     matrix, info = load_eye_in_hand_transform(path)
     assert matrix is not None
+    assert info["npy_file"].endswith("T_cam2hand.npy")
+    assert "eye_in_hand_20261029_160039_npy" in info["npy_file"]
     assert info["serial"] == "233722073797"
     assert info["hand_frame"] == "right_wrist_yaw_link"
     assert info["pass"] is True
@@ -710,3 +733,82 @@ def test_yellow_lock_gives_up_after_the_region_jumps_away(monkeypatch):
         assert annotator.wrist_pbvs_view()["yellow_lock"] is True
     annotator._note_wrist_pbvs(far, touch, None)
     assert annotator.wrist_pbvs_view()["yellow_lock"] is False
+
+
+def test_wrist_finger_lock_keeps_the_first_point_until_recapture():
+    first = CameraPoint(u=30.0, v=40.0, source="finger", confidence=0.9)
+    later = CameraPoint(u=80.0, v=10.0, source="finger", confidence=0.95)
+    tip, locked, pending = latch_wrist_finger_tip(None, first, recapture=False)
+    assert (tip.u, tip.v) == (30.0, 40.0)
+    assert tip.source == "finger_lock"
+    assert pending is False
+    tip, locked, pending = latch_wrist_finger_tip(locked, later, recapture=False)
+    assert (tip.u, tip.v) == (30.0, 40.0)
+    tip, locked, pending = latch_wrist_finger_tip(locked, later, recapture=True)
+    assert (tip.u, tip.v) == (80.0, 10.0)
+    assert pending is False
+    third = CameraPoint(u=1.0, v=1.0, source="finger")
+    tip, locked, _pending = latch_wrist_finger_tip(locked, third, recapture=False)
+    assert (tip.u, tip.v) == (80.0, 10.0)
+
+
+def test_revo2_wrist_follows_the_live_fingertip_until_lock_is_enabled():
+    annotator = LiveIbvsAnnotator(ignore_gripper=True)
+    assert annotator.finger_tip_status()["finger_tip_lock_enabled"] is False
+    frame = np.zeros((80, 120, 3), dtype=np.uint8)
+    first = YoloTouch(points={"FingerTip": YoloPoint("FingerTip", 30.0, 40.0, 0.9)})
+    second = YoloTouch(points={"FingerTip": YoloPoint("FingerTip", 90.0, 10.0, 0.95)})
+    _vis, _corners, tip = annotator._paint_side(frame, first)
+    assert tip is not None and tip.source == "finger"
+    assert (tip.u, tip.v) == (30.0, 40.0)
+    annotator.set_sdk_active(True)
+    _vis, _corners, tip = annotator._paint_side(frame, second)
+    assert tip.source == "finger"
+    assert (tip.u, tip.v) == (90.0, 10.0)
+    assert annotator._finger_lock is None
+    assert "每帧检测" in annotator.recapture_finger_tip()
+    assert "已打开" in annotator.toggle_finger_lock()
+    _vis, _corners, tip = annotator._paint_side(frame, first)
+    assert tip.source == "finger_lock"
+    assert (tip.u, tip.v) == (30.0, 40.0)
+    annotator.set_target("button_2")
+    annotator.forget_button_lock()
+    _vis, _corners, tip = annotator._paint_side(frame, second)
+    assert (tip.u, tip.v) == (30.0, 40.0)
+    assert "等待下一帧" in annotator.recapture_finger_tip()
+    _vis, _corners, tip = annotator._paint_side(frame, second)
+    assert (tip.u, tip.v) == (90.0, 10.0)
+    assert annotator.finger_tip_status()["finger_tip_lock"]["u"] == 90.0
+    assert "已关闭" in annotator.toggle_finger_lock()
+    _vis, _corners, tip = annotator._paint_side(frame, first)
+    assert tip.source == "finger"
+    assert (tip.u, tip.v) == (30.0, 40.0)
+    assert annotator._finger_lock is None
+
+
+def test_nearest_yellow_bar_follows_the_fingertip():
+    image = np.zeros((80, 160, 3), dtype=np.uint8)
+    image[10:16, 10:80] = (0, 220, 255)
+    image[50:56, 90:150] = (0, 220, 255)
+    near_top = nearest_long_yellow_bar(image, (20.0, 30.0))
+    near_bottom = nearest_long_yellow_bar(image, (130.0, 60.0))
+    assert near_top is not None and near_bottom is not None
+    assert near_top[1] < 30.0
+    assert near_bottom[1] > 40.0
+    assert nearest_long_yellow_bar(image, None) is None
+
+
+def test_wrist_uses_the_nearest_yellow_bar_when_the_button_is_missing(monkeypatch):
+    monkeypatch.setattr("ibvs_pad_touch.web.live_ibvs.read_depth", lambda _path: None)
+    annotator = LiveIbvsAnnotator()
+    annotator.set_wrist_pbvs_watch(True)
+    annotator.ctrl.set_target("button_1")
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+    frame[10:16, 10:80] = (0, 220, 255)
+    frame[50:56, 90:150] = (0, 220, 255)
+    annotator._note_wrist_pbvs(frame, YoloTouch(points={}), CameraPoint(u=20.0, v=30.0, source="finger"))
+    view = annotator.wrist_pbvs_view()
+    assert view["target_source"] == "yellow_bar"
+    assert view["close_range"] is True
+    assert view["target_uv"][1] < 30.0
+    assert view["tip_uv"] == [20.0, 30.0]

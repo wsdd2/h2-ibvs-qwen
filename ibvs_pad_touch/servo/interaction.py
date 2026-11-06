@@ -87,8 +87,12 @@ def eye_in_hand_ibvs_step(
         lambda_xy=float(lambda_xy),
         lambda_z=float(lambda_z),
     )
-    step = _clip_norm(velocity * float(dt_s), float(max_step_m))
     pixel_err = float(np.hypot(float(button_uv[0]) - float(tip_uv[0]), float(button_uv[1]) - float(tip_uv[1])))
+    # Panel Y/Z first. Camera Z is the approach into the panel, so it stays
+    # shut until the fingertip pixel meets the button.
+    if pixel_err > float(pixel_tol):
+        velocity = np.array([float(velocity[0]), float(velocity[1]), 0.0], dtype=np.float64)
+    step = _clip_norm(velocity * float(dt_s), float(max_step_m))
     depth_err = float(z - float(tip_z_m)) if has_tip_z else None
     if not has_tip_z and pixel_err <= float(pixel_tol):
         step = _clip_norm(step + np.array([0.0, 0.0, float(aligned_approach_m)]), float(max_step_m))

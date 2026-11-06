@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import threading
 import time
@@ -29,6 +30,15 @@ from ibvs_pad_touch.camera.devices import (
 )
 from ibvs_pad_touch.camera.image_io import write_bgr, write_depth
 from ibvs_pad_touch.camera.realsense_bind import usable_realsense
+
+# Ctrl+C used to kill this process before pipeline.stop(). The USB interface
+# then stays claimed until the Orin itself is power-cycled.
+_STOP = threading.Event()
+
+
+def _request_stop(signum, _frame) -> None:
+    print(f"[ibvs-cam] signal {signum}, stopping cameras", flush=True)
+    _STOP.set()
 
 
 def _open_profiles(fps: int, want_depth: bool) -> list[tuple[int, bool]]:
@@ -162,7 +172,7 @@ def _read_frames(
     deadline = started + 8.0
     last_color = started
     last_note = started
-    while True:
+    while not _STOP.is_set():
         now = time.monotonic()
         try:
             pack = _grab_frames(pipe)
@@ -301,7 +311,7 @@ def serve_camera(rs, args) -> None:
         f"[ibvs-cam] {args.name} prefer={args.serial or '-'} py={sys.executable} bind={getattr(rs, '__file__', '')}",
         flush=True,
     )
-    while True:
+    while not _STOP.is_set():
         devices = list_realsense(rs)
         write_seen(devices)
         line = format_device_line(devices)
@@ -370,13 +380,26 @@ def serve_camera(rs, args) -> None:
                     pipe.stop()
                 except Exception:
                     pass
-            if opened:
-                break
+            if _STOP.is_set():
+                return
             print(
-                f"[ibvs-cam] {args.name} no depth frame @{fps}; retrying with depth still on",
+                f"[ibvs-cam] {args.name} stream ended @{fps}; reopening",
                 flush=True,
             )
             time.sleep(0.5)
+        time.sleep(1.0)
+
+
+def _run_camera(rs, cam) -> None:
+    """Keep this camera open until the process is actually asked to stop."""
+    while not _STOP.is_set():
+        try:
+            serve_camera(rs, cam)
+        except Exception as exc:
+            print(f"[ibvs-cam] {cam.name} thread error: {exc}", flush=True)
+        if _STOP.is_set():
+            return
+        print(f"[ibvs-cam] {cam.name} restarting", flush=True)
         time.sleep(1.0)
 
 
@@ -413,19 +436,31 @@ def main() -> None:
     if rs is None:
         print(f"[ibvs-cam] no rs.pipeline in {sys.executable}", flush=True)
         sys.exit(2)
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
     if args.dual:
         if len(args.cam) < 2:
             parser.error("--dual needs at least two --cam name:serial:out:depth")
         cameras = [_parse_cam_spec(spec) for spec in args.cam]
         threads = [
-            threading.Thread(target=serve_camera, args=(rs, cam), name=f"cam-{cam.name}", daemon=True)
+            threading.Thread(target=_run_camera, args=(rs, cam), name=f"cam-{cam.name}")
             for cam in cameras
         ]
         for thread in threads:
             thread.start()
             time.sleep(0.8)
+        while not _STOP.is_set():
+            for index, cam in enumerate(cameras):
+                if threads[index].is_alive():
+                    continue
+                print(f"[ibvs-cam] {cam.name} thread exited; starting it again", flush=True)
+                threads[index] = threading.Thread(
+                    target=_run_camera, args=(rs, cam), name=f"cam-{cam.name}"
+                )
+                threads[index].start()
+            time.sleep(0.5)
         for thread in threads:
-            thread.join()
+            thread.join(timeout=5.0)
         return
     if not args.name:
         parser.error("--name is required unless --dual is set")

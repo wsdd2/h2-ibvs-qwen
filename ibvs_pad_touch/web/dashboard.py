@@ -19,8 +19,10 @@ from ibvs_pad_touch.camera.image_io import pick_sidecar, read_depth, read_image
 from ibvs_pad_touch.camera.realsense_bind import usable_realsense as _usable_realsense
 from ibvs_pad_touch.config import camera_views, load_camera_config
 from ibvs_pad_touch.web.joints import UpperBodyJointReader
+from ibvs_pad_touch.web.panel_records import PanelRecords
 from ibvs_pad_touch.web.recorder import MotionTrajectoryRecorder, SessionRecorder
-from ibvs_pad_touch.web.revo2_hand import LeftRevo2
+from ibvs_pad_touch.web.records_site import build_records_app
+from ibvs_pad_touch.web.revo2_hand import LeftRevo2, Revo2Hand
 
 
 COMMANDS = {
@@ -45,6 +47,11 @@ COMMANDS = {
     "left_index",
     "left_open",
     "left_stop",
+    "right_press",
+    "right_open",
+    "right_stop",
+    "redetect_finger",
+    "finger_lock_off",
     "hang",
     "level_right",
     "estop",
@@ -98,9 +105,9 @@ class _QuietHandler(WSGIRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
 
 
-def serve_wsgi(app, host: str, port: int) -> None:
+def serve_wsgi(app, host: str, port: int, banner: str = "ibvs-web") -> None:
     """Avoid Flask/Werkzeug's built-in server. H2 --user Flask often has broken metadata."""
-    print(f"[ibvs-web] wsgiref http://{host}:{port}/", flush=True)
+    print(f"[{banner}] wsgiref http://{host}:{port}/", flush=True)
     httpd = make_server(host, int(port), app, server_class=_ThreadingWSGIServer, handler_class=_QuietHandler)
     try:
         httpd.serve_forever()
@@ -466,6 +473,9 @@ class RealRobotDashboard:
         pbvs_step_m: float = 0.020,
         pbvs_step_seconds: float = 0.45,
         pbvs_max_joint_deg: float = 20.0,
+        right_ee: str = "dex1",
+        records_port: int = 8082,
+        revo2_bridge: str = "",
     ) -> None:
         cam = load_camera_config()["camera"]
         self.host = host
@@ -496,7 +506,14 @@ class RealRobotDashboard:
             float(eye_to_hand_z_bias_m),
         )
         self.joints = UpperBodyJointReader(iface=iface, demo=demo)
+        self.right_ee = str(right_ee or "dex1").strip().lower()
+        if self.right_ee not in {"dex1", "revo2"}:
+            raise ValueError("right_ee 只能是 dex1 或 revo2")
         self.revo2 = LeftRevo2(iface=iface)
+        self.revo2_bridge = str(revo2_bridge or "").strip()
+        self.revo2_right = Revo2Hand(side="right", iface=iface, bridge=self.revo2_bridge)
+        if self.revo2_bridge:
+            print(f"[ibvs-web] right Revo2 via bridge {self.revo2_bridge}", flush=True)
         try:
             from ibvs_pad_touch.web.live_ibvs import LiveIbvsAnnotator
 
@@ -506,6 +523,8 @@ class RealRobotDashboard:
                 eye_to_hand_x_bias_m=eye_to_hand_x_bias_m,
                 eye_to_hand_y_bias_m=eye_to_hand_y_bias_m,
                 eye_to_hand_z_bias_m=eye_to_hand_z_bias_m,
+                ignore_gripper=self.right_ee == "revo2",
+                async_preview=not demo,
             )
         except Exception as exc:
             self.ibvs = None
@@ -537,7 +556,14 @@ class RealRobotDashboard:
             pbvs_step_m=pbvs_step_m,
             pbvs_step_seconds=pbvs_step_seconds,
             pbvs_max_joint_deg=pbvs_max_joint_deg,
+            right_ee=self.right_ee,
         )
+        self.records_port = max(0, int(records_port))
+        self.records = PanelRecords(Path(__file__).resolve().parents[2] / "outputs" / "panel_records")
+        self._records_started = False
+        self.arm.on_screen_record = self._remember_screen
+        self.arm.on_task_begin = self._remember_task_begin
+        self.arm.on_task_end = self._remember_task_end
         if self.ibvs is not None:
             self.ibvs.set_side_ready(lambda: bool(self.arm.status().get("left_side_ready")))
             self.ibvs.set_control_stage(lambda: str(self.arm.status().get("control_stage") or ""))
@@ -579,6 +605,7 @@ class RealRobotDashboard:
         self._started = True
         print(f"[ibvs-web] http://{self.host}:{self.port}/")
         print(f"[ibvs-web] 本机浏览器: http://127.0.0.1:{self.port}/   局域网: http://<h2-ip>:{self.port}/")
+        self._start_records_site()
 
     def run_forever(self) -> None:
         print(
@@ -588,6 +615,7 @@ class RealRobotDashboard:
         )
         print("[ibvs-web] camera frames from sidecars; Start uses cyclonedds._clayer in this process")
         print("[ibvs-web] Ctrl+C / SIGTERM 会先放下右臂再退出；网页 Stop 仍保持姿态")
+        self._start_records_site()
         try:
             serve_wsgi(self._app, self.host, self.port)
         finally:
@@ -602,6 +630,10 @@ class RealRobotDashboard:
                 pass
         try:
             self.revo2.stop()
+        except Exception:
+            pass
+        try:
+            self.revo2_right.stop()
         except Exception:
             pass
         self.recorder.end()
@@ -638,6 +670,12 @@ class RealRobotDashboard:
             hand_message = self.revo2.open_hand()
         elif command == "left_stop":
             hand_message = self.revo2.stop()
+        elif command == "right_press":
+            hand_message = self.revo2_right.hold_press_now()
+        elif command == "right_open":
+            hand_message = self.revo2_right.open_hand()
+        elif command == "right_stop":
+            hand_message = self.revo2_right.stop()
         with self._lock:
             if command in TARGET_LABELS:
                 if command != self._target:
@@ -692,8 +730,18 @@ class RealRobotDashboard:
                 self._message = self.arm.set_motion_backend("arm_sdk")
             elif command == "backend_service":
                 self._message = self.arm.set_motion_backend("service")
-            elif command in {"left_index", "left_open", "left_stop"}:
+            elif command in {"left_index", "left_open", "left_stop", "right_press", "right_open", "right_stop"}:
                 self._message = hand_message
+            elif command == "redetect_finger":
+                if self.ibvs is None or not hasattr(self.ibvs, "recapture_finger_tip"):
+                    self._message = "右腕画面未加载，不能重新检测指尖"
+                else:
+                    self._message = self.ibvs.recapture_finger_tip()
+            elif command == "finger_lock_off":
+                if self.ibvs is None or not hasattr(self.ibvs, "toggle_finger_lock"):
+                    self._message = "右腕画面未加载，不能关闭指尖锁定"
+                else:
+                    self._message = self.ibvs.toggle_finger_lock()
             elif command == "hang":
                 self._running = False
                 self._message = self.arm.hang_arms()
@@ -750,8 +798,12 @@ class RealRobotDashboard:
             self.arm.update_joint_readback([float(row["q"]) for row in right_rows])
         payload["upper_body"] = upper.as_dict()
         payload["ibvs"] = None if self.ibvs is None else self.ibvs.telemetry()
-        payload["arm"] = self.arm.status()
+        arm_status = self.arm.status()
+        if self.ibvs is not None and hasattr(self.ibvs, "set_sdk_active"):
+            self.ibvs.set_sdk_active(bool(arm_status.get("sdk_active")))
+        payload["arm"] = arm_status
         payload["revo2_left"] = self.revo2.status()
+        payload["revo2_right"] = None if self.revo2_right is None else self.revo2_right.status()
         payload["record"] = self.recorder.status()
         payload["trajectory"] = self.motion_trajectories.status()
         payload["screen"] = {
@@ -763,6 +815,54 @@ class RealRobotDashboard:
         payload["eye_to_hand_bias_m"] = self._eye_bias_payload()
         payload["updated_at"] = time.time()
         return payload
+
+    def _panel_status(self) -> dict[str, Any]:
+        status = self.arm.status()
+        steps = list(status.get("button_sequence") or [])
+        index = int(getattr(self.arm, "_sequence_index", -1))
+        return {
+            "phase": status.get("phase") or "",
+            "message": status.get("message") or "",
+            "running": bool(status.get("running")),
+            "control_stage": status.get("control_stage") or "",
+            "sequence_run": bool(status.get("sequence_run")),
+            "sequence_stage": status.get("sequence_stage") or "",
+            "sequence_mode": status.get("sequence_mode") or "",
+            "sequence_index": index,
+            "sequence_total": len(steps),
+            "screen_report": status.get("screen_report") or "",
+            "screen_history": list(status.get("screen_history") or [])[-8:],
+            "screen_progress": bool(status.get("screen_progress")),
+            "button_sequence": steps,
+            "updated_at": time.time(),
+        }
+
+    def _remember_screen(self, image, label: str, info) -> None:
+        self.records.submit_screen(image, str(label or ""), info, self._panel_status())
+
+    def _remember_task_begin(self) -> None:
+        self.records.open_task(self._panel_status())
+
+    def _remember_task_end(self, reason: str) -> None:
+        self.records.close_task(str(reason or "stopped"), self._panel_status())
+
+    def _start_records_site(self) -> None:
+        if self._records_started or self.records_port <= 0:
+            return
+        self._records_started = True
+        app = build_records_app(self.records, self._panel_status)
+        host = self.host
+        port = self.records_port
+
+        def _serve() -> None:
+            try:
+                serve_wsgi(app, host, port, banner="ibvs-records")
+            except OSError as exc:
+                print(f"[ibvs-records] 端口 {port} 没有打开: {exc}", flush=True)
+
+        threading.Thread(target=_serve, name="panel-records", daemon=True).start()
+        print(f"[ibvs-records] 客户记录 http://{host}:{port}/", flush=True)
+        print(f"[ibvs-records] 局域网笔记本打开 http://<机器人IP>:{port}/", flush=True)
 
     def _eye_bias_payload(self) -> dict[str, float]:
         x_m, y_m, z_m = self._startup_eye_bias_m
@@ -789,7 +889,8 @@ class RealRobotDashboard:
     def _configure_routes(self) -> None:
         @self._app.get("/")
         def index() -> Response:
-            response = make_response(PAGE_HTML)
+            page = PAGE_HTML.replace("__RECORDS_PORT__", str(int(self.records_port or 0)))
+            response = make_response(page)
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
             return response
 
@@ -893,6 +994,7 @@ class RealRobotDashboard:
                 "button_1\n"
                 "button_2\n"
                 "button_3\n"
+                "FingerTip\n"
             )
             for labels_path in (self.dataset_root / "labels.txt", folder / "labels.txt"):
                 if not labels_path.exists():
@@ -1109,6 +1211,7 @@ PAGE_HTML = """<!doctype html>
     header{padding:10px 14px;background:#1b1b1b;border-bottom:1px solid #333;display:flex;gap:12px;align-items:center;flex:0 0 auto}
     h1{margin:0;font-size:18px;font-weight:600}
     .meta{color:#9fd0ff;font:12px Consolas,monospace}
+    a.meta{color:#9fd0ff;text-decoration:none}
     .layout{display:flex;height:calc(100vh - 46px);min-height:0}
     .videos-col{flex:1;min-width:0;min-height:0;overflow:auto;background:#000;display:flex;flex-direction:column}
     .videos{display:grid;grid-template-columns:1fr 1fr;background:#000;min-height:min(48vh,520px);flex:0 0 auto}
@@ -1184,11 +1287,13 @@ PAGE_HTML = """<!doctype html>
     th:first-child,td:first-child{text-align:left}
     h3{margin:16px 0 6px;font-size:14px;color:#bbb}
     pre{white-space:pre-wrap;font-size:12px;line-height:1.35}
+    #actionPose{max-height:9.5em;overflow:auto;margin:6px 0 10px;color:#d8f1ff}
   </style>
 </head>
 <body>
 <header>
   <h1>H2 IBVS 实机监视</h1>
+  <a class="meta" id="recordsLink" href=""></a>
   <span class="meta" id="camMeta">sidecar-bgr …</span>
 </header>
 <div class="layout">
@@ -1261,6 +1366,13 @@ PAGE_HTML = """<!doctype html>
       <button class="mode" data-cmd="left_open" onclick="send('left_open',this)" title="左手五指张开">左手张开</button>
       <button class="mode" data-cmd="left_stop" onclick="send('left_stop',this)" title="停止向左手发送">左手停止</button>
       <span id="revo2Status" class="hint">左手未发送</span>
+      <button class="mode" data-cmd="right_press" onclick="send('right_press',this)" title="只发右手，不举臂。姿势取已保存的 revo2_test.yaml 里的 test_pose">右手预备</button>
+      <button class="mode" data-cmd="right_open" onclick="send('right_open',this)" title="只张开右手">右手张开</button>
+      <button class="mode" data-cmd="right_stop" onclick="send('right_stop',this)" title="停止向右手发送">右手停止</button>
+      <button class="mode" data-cmd="redetect_finger" onclick="send('redetect_finger',this)" title="只在指尖锁定打开时有效。用下一帧 FingerTip 替换锁定点。默认锁定是关的，每帧都用实时检测">重新检测指尖</button>
+      <button class="mode" id="fingerLockButton" data-cmd="finger_lock_off" onclick="send('finger_lock_off',this)" title="默认关闭。手腕转动时相机和灵巧手会相对移动，指尖跟着每帧检测走。打开后才冻结下一次检出的指尖">打开指尖锁定</button>
+      <span id="fingerLockStatus" class="hint">指尖未锁定</span>
+      <span id="revo2RightStatus" class="hint">右手未发送</span>
       <button class="mode" data-cmd="backend_service" onclick="send('backend_service',this)">Service</button>
       <button class="scan" data-cmd="scan" onclick="send('scan',this)">Raise</button>
       <button class="scan" data-cmd="level_right" onclick="send('level_right',this)" title="已关闭，不会动右臂">Right level off</button>
@@ -1351,6 +1463,7 @@ PAGE_HTML = """<!doctype html>
     </div>
     <div id="pills"></div>
     <div class="hint" id="message">loading…</div>
+    <pre id="actionPose">动作结束坐标：尚无</pre>
     <div class="coord-panel">
       <h3>目标 / right_ee_link（Torso_Link 坐标）</h3>
       <table>
@@ -1388,6 +1501,7 @@ PAGE_HTML = """<!doctype html>
         <tr><td>PBVS error cam m</td><td id="ibvs-pbvs-error">—</td></tr>
         <tr><td>PBVS error torso m</td><td id="ibvs-pbvs-error-torso">—</td></tr>
         <tr><td>PBVS tip source</td><td id="ibvs-pbvs-source">—</td></tr>
+        <tr><td>腰 yaw 偏差</td><td id="waist-yaw">—</td></tr>
         <tr><td>dx dy dz m</td><td id="ibvs-dxyz">—</td></tr>
         <tr><td>droll dpitch dyaw deg</td><td id="ibvs-drpy">—</td></tr>
         <tr><td>handeye</td><td id="ibvs-handeye">—</td></tr>
@@ -1410,6 +1524,14 @@ PAGE_HTML = """<!doctype html>
   </div>
 </div>
 <script>
+const recordsPort = __RECORDS_PORT__;
+(function(){
+  const link=document.getElementById('recordsLink');
+  if(!link) return;
+  if(!recordsPort){ link.style.display='none'; return; }
+  link.href='http://'+location.hostname+':'+recordsPort+'/';
+  link.textContent='客户记录 :'+recordsPort;
+})();
 function imageUv(event){
   const img=event.currentTarget, r=img.getBoundingClientRect();
   const nw=img.naturalWidth||640, nh=img.naturalHeight||480;
@@ -1648,7 +1770,7 @@ async function submitEyeBias(ev){
 }
 async function send(command, btn){
   const slot=document.getElementById('message');
-  const handHints={left_index:'正在发送左手食指…',left_open:'正在张开左手…',left_stop:'正在停止左手…'};
+  const handHints={left_index:'正在发送左手食指…',left_open:'正在张开左手…',left_stop:'正在停止左手…',right_press:'正在发送右手预备…',right_open:'正在张开右手…',right_stop:'正在停止右手…'};
   if(slot) slot.textContent=command==='backend_arm_sdk'?'正在拉起 arm_sdk…':(handHints[command]||('已点击 '+command));
   if(btn) btn.classList.add('active');
   try{
@@ -1827,6 +1949,7 @@ async function refresh(){
       `mode:${s.arm?.servo_mode==='direct_pbvs'?'PBVS-DIRECT':(s.arm?.servo_mode==='hybrid'?'HYBRID-VS':(s.arm?.servo_mode==='direct_ee'?'DIRECT-EE':'DUAL-IBVS'))}`,
       `link:${s.arm?.motion_backend==='service'?'service':'arm_sdk'}`,
       `revo2:${s.revo2_left?.holding?(s.revo2_left.name||'hold'):(s.revo2_left?.error?'offline':'wait')}`,
+      `right:${s.arm?.right_ee||'dex1'}${s.revo2_right?.holding?':'+s.revo2_right.name:(s.revo2_right?.error?':offline':'')}`,
       `gravity:${s.arm&&s.arm.gravity?'on':'off'}`,
       `sdk:${s.arm&&s.arm.sdk_active?'hold':'released'}`,
       `rec:${s.record?.recording?'REC':(s.record?.enabled?'armed':'off')}`,
@@ -1840,6 +1963,9 @@ async function refresh(){
     document.getElementById('message').textContent=(sequenceStage && detail && !String(detail).startsWith(sequenceStage))
       ? (sequenceStage+' · '+detail)
       : (detail||sequenceStage);
+    const actionPose=document.getElementById('actionPose');
+    const poses=s.arm?.action_pose_history||[];
+    if(actionPose) actionPose.textContent=poses.length?poses.join('\\n'):'动作结束坐标：尚无';
     document.getElementById('ibvs-phase').textContent = ibvs.phase||'—';
     document.getElementById('ibvs-uv').textContent = ibvs.target_uv ? ibvs.target_uv.join(', ') : '—';
     document.getElementById('ibvs-tip-uv').textContent = ibvs.tip_uv ? ibvs.tip_uv.join(', ') : '—';
@@ -1849,6 +1975,15 @@ async function refresh(){
     document.getElementById('ibvs-pbvs-error').textContent = ibvs.pbvs_error_cam_m ? ibvs.pbvs_error_cam_m.join(', ') : '—';
     document.getElementById('ibvs-pbvs-error-torso').textContent = ibvs.pbvs_error_torso_m ? ibvs.pbvs_error_torso_m.join(', ') : '—';
     document.getElementById('ibvs-pbvs-source').textContent = ibvs.pbvs_tip_source || '—';
+    const yawErr = s.arm ? s.arm.waist_yaw_error_deg : null;
+    const bodyErr = s.arm ? s.arm.body_yaw_error_deg : null;
+    const yawText = (yawErr===undefined || yawErr===null)
+      ? ''
+      : `腰 ${num(yawErr,2)}°  ${num((s.arm&&s.arm.waist_yaw_tau)||0,1)} Nm`;
+    const bodyText = (bodyErr===undefined || bodyErr===null)
+      ? ''
+      : `机身 ${num(bodyErr,2)}°  ${num((s.arm&&s.arm.body_yaw_rate)||0,3)} rad/s`;
+    document.getElementById('waist-yaw').textContent = [yawText, bodyText].filter(Boolean).join('  ') || '—';
     document.getElementById('ibvs-dxyz').textContent = [ibvs.dx,ibvs.dy,ibvs.dz].map(v=>num(v,4)).join('  ');
     document.getElementById('ibvs-drpy').textContent = [ibvs.droll,ibvs.dpitch,ibvs.dyaw].map(v=>num(v,2)).join('  ');
     document.getElementById('ibvs-handeye').textContent = (ibvs.handeye&&ibvs.handeye.file) ? ibvs.handeye.file : 'missing';
@@ -1950,6 +2085,28 @@ async function refresh(){
       handSlot.textContent=hand.error
         ? ('左手 '+hand.error)
         : (hand.holding ? ('左手 '+(hand.name||'hold')+' ['+shown+']') : '左手未发送');
+    }
+    const fingerLock=document.getElementById('fingerLockStatus');
+    if(fingerLock){
+      const finger=s.ibvs?.finger_tip_text||'';
+      fingerLock.textContent=finger||(s.arm?.right_ee==='revo2'?'指尖未锁定':'');
+      if(s.ibvs?.finger_tip_recapture) document.querySelector('button[data-cmd="redetect_finger"]')?.classList.add('active');
+      const fingerButton=document.getElementById('fingerLockButton');
+      if(fingerButton){
+        const enabled=s.ibvs?.finger_tip_lock_enabled!==false;
+        fingerButton.textContent=enabled?'关闭指尖锁定':'打开指尖锁定';
+        if(!enabled) fingerButton.classList.add('active');
+      }
+    }
+    const right=s.revo2_right||{};
+    const rightSlot=document.getElementById('revo2RightStatus');
+    if(right.holding && (right.name||'').indexOf('预备')>=0) document.querySelector('button[data-cmd="right_press"]')?.classList.add('active');
+    if(right.holding && (right.command||[]).length===6 && (right.command||[]).every(v=>v===0)) document.querySelector('button[data-cmd="right_open"]')?.classList.add('active');
+    if(rightSlot){
+      const state=(right.state||[]).map(v=>Number(v).toFixed(3)).join(', ');
+      rightSlot.textContent=right.error
+        ? ('右手 '+right.error)
+        : (right.holding ? ('右手 '+(right.name||'hold')+' 状态['+state+']') : '右手未发送');
     }
     const rec=document.getElementById('recordToggle');
     const recLabel=document.getElementById('recordLabel');

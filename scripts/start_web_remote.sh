@@ -21,6 +21,34 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+# Robot PC2 keeps eth0 (192.168.123.162). Orin has no eth0; its link to the
+# robot PC2 Wi-Fi is wlan0 (192.168.1.72).
+IFACE="eth0"
+for i in "${!EXTRA[@]}"; do
+  if [ "${EXTRA[$i]}" = "--iface" ] && [ $((i + 1)) -lt ${#EXTRA[@]} ]; then
+    IFACE="${EXTRA[$((i + 1))]}"
+  fi
+done
+if ! ip link show "$IFACE" >/dev/null 2>&1; then
+  if ip link show wlan0 >/dev/null 2>&1; then
+    echo "[ibvs] ${IFACE} is not on this machine; DDS uses wlan0"
+    replaced=0
+    for i in "${!EXTRA[@]}"; do
+      if [ "${EXTRA[$i]}" = "--iface" ] && [ $((i + 1)) -lt ${#EXTRA[@]} ]; then
+        EXTRA[$((i + 1))]="wlan0"
+        replaced=1
+      fi
+    done
+    if [ "$replaced" -eq 0 ]; then
+      EXTRA+=("--iface" "wlan0")
+    fi
+    IFACE="wlan0"
+  else
+    echo "[ibvs] WARN: DDS iface ${IFACE} is not on this machine" >&2
+  fi
+fi
+echo "[ibvs] dds iface=${IFACE}"
+
 if [ "$DETACH" -eq 0 ]; then
   # shellcheck source=session_log.sh
   . "$ROOT/scripts/session_log.sh"
@@ -194,7 +222,24 @@ cleanup() {
   local pid
   for pid in "${CAM_PIDS[@]:-}"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  local _cam_wait
+  for _cam_wait in 1 2 3 4 5 6 7 8 9 10; do
+    local _cam_alive=0
+    for pid in "${CAM_PIDS[@]:-}"; do
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        _cam_alive=1
+      fi
+    done
+    [ "${_cam_alive}" -eq 0 ] && break
+    sleep 0.4
+  done
+  for pid in "${CAM_PIDS[@]:-}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "[ibvs] camera ${pid} did not stop, kill -9"
+      kill -9 "$pid" 2>/dev/null || true
     fi
   done
   wait "${WEB_PID}" "${JOINT_PID}" "${CAM_PIDS[@]:-}" 2>/dev/null || true
@@ -264,17 +309,17 @@ launch_camera_pair() {
   done
   case "${IBVS_CAM_LD_LIBRARY_PATH:-clean}" in
     inherit)
-      "${wrap[@]}" env \
+      exec "${wrap[@]}" env \
         PYTHONPATH="${IBVS_CAM_PYTHONPATH}" PYTHONUNBUFFERED=1 \
         "$CAM_PY" "$ROOT/scripts/camera_sidecar.py" "${py_args[@]}"
       ;;
     clean|"")
-      "${wrap[@]}" env -u LD_LIBRARY_PATH \
+      exec "${wrap[@]}" env -u LD_LIBRARY_PATH \
         PYTHONPATH="${IBVS_CAM_PYTHONPATH}" PYTHONUNBUFFERED=1 \
         "$CAM_PY" "$ROOT/scripts/camera_sidecar.py" "${py_args[@]}"
       ;;
     *)
-      "${wrap[@]}" env LD_LIBRARY_PATH="${IBVS_CAM_LD_LIBRARY_PATH}" \
+      exec "${wrap[@]}" env LD_LIBRARY_PATH="${IBVS_CAM_LD_LIBRARY_PATH}" \
         PYTHONPATH="${IBVS_CAM_PYTHONPATH}" PYTHONUNBUFFERED=1 \
         "$CAM_PY" "$ROOT/scripts/camera_sidecar.py" "${py_args[@]}"
       ;;
@@ -306,8 +351,11 @@ start_camera_sidecars() {
 
 CAM_PY=""
 IBVS_CAM_LD_LIBRARY_PATH=""
-pkill -f '[c]amera_sidecar.py' >/dev/null 2>&1 || true
-sleep 0.3
+pkill -TERM -f '[c]amera_sidecar.py' >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8; do
+  pgrep -f '[c]amera_sidecar.py' >/dev/null 2>&1 || break
+  sleep 0.4
+done
 if _cam_pick="$(pick_camera_python)"; then
   CAM_PY="$(printf '%s\n' "$_cam_pick" | head -n 1)"
   IBVS_CAM_LD_LIBRARY_PATH="$(printf '%s\n' "$_cam_pick" | sed -n '2p')"
@@ -324,7 +372,7 @@ unset _cam_pick
 
 if [ "$DETACH" -eq 1 ]; then
   echo "[ibvs] h2_arm_service_node stays down until the Service button."
-  PYTHONPATH="${IBVS_WEB_PYTHONPATH}" nohup "$JOINT_PY" "$ROOT/scripts/joint_sidecar.py" eth0 > /tmp/ibvs_joints.log 2>&1 &
+  PYTHONPATH="${IBVS_WEB_PYTHONPATH}" nohup "$JOINT_PY" "$ROOT/scripts/joint_sidecar.py" "${IFACE}" > /tmp/ibvs_joints.log 2>&1 &
   echo $! > /tmp/ibvs_joints.pid
   if [ -n "${CAM_PY:-}" ]; then
     clear_camera_files
@@ -358,7 +406,7 @@ echo "[ibvs] arm_sdk and h2_arm_service_node stay down until their buttons. AI s
 echo "[ibvs] Ctrl+C lowers the right arm (~8s), then stops h2_arm_service_node if Service was used."
 start_camera_sidecars
 
-PYTHONPATH="${IBVS_WEB_PYTHONPATH}" PYTHONUNBUFFERED=1 "$JOINT_PY" "$ROOT/scripts/joint_sidecar.py" eth0 \
+PYTHONPATH="${IBVS_WEB_PYTHONPATH}" PYTHONUNBUFFERED=1 "$JOINT_PY" "$ROOT/scripts/joint_sidecar.py" "${IFACE}" \
   > >(sed -u 's/^/[joints] /') 2>&1 &
 JOINT_PID=$!
 echo $! > /tmp/ibvs_joints.pid

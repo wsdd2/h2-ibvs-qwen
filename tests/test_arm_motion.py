@@ -16,7 +16,13 @@ from ibvs_pad_touch.web.arm_motion import (
     service_rise_before_wall,
     pbvs_descent_step,
     pbvs_forward_step,
+    pbvs_retract_step,
     pbvs_lateral_step,
+    pbvs_x_step,
+    pbvs_yz_align_step,
+    pbvs_yz_hold_goal,
+    direct_pbvs_arrived,
+    direct_pbvs_round_stalled,
     quintic_joint_seconds,
     slerp_rpy,
     RIGHT_ARM_JOINTS,
@@ -37,6 +43,7 @@ from ibvs_pad_touch.web.arm_motion import (
     WRIST_VIEW_DEG,
     camera_delta_to_torso,
     direct_pbvs_motion_goal,
+    cap_tool_x,
     expand_quintic_knots,
     fuse_pbvs_buttons,
     relax_x_clearance,
@@ -66,6 +73,9 @@ def test_direct_pbvs_goes_to_the_button_point():
     assert direct_pbvs_motion_goal((0.20, -0.02, 0.20), button) == button
     assert direct_pbvs_motion_goal((0.58, -0.10, 0.44), button) == button
     assert direct_pbvs_motion_goal((0.40, -0.12, 0.44), button) == button
+    assert cap_tool_x((0.6345, -0.1718, 0.3983), 0.6149) == (0.6149, -0.1718, 0.3983)
+    assert pbvs_retract_step((-0.0196, 0.02, 0.03), past_m=0.0) is not None
+    assert pbvs_retract_step((0.02, 0.0, 0.0), past_m=0.0) is None
     assert abs(relax_x_clearance(0.08, 0.04, 0.04) - 0.06) < 1e-9
 
 
@@ -392,18 +402,25 @@ def test_raise_moves_left_side_view_then_right_ready():
 
 
 def test_release_for_operator_drops_sdk_and_keeps_idle_preview():
-    released = []
-
     class _Controller:
+        def __init__(self):
+            self.aborted = False
+            self.released = []
+
+        def abort(self):
+            self.aborted = True
+            self._aborted = True
+
         def release(self, seconds):
-            released.append(seconds)
+            self.released.append(seconds)
 
     class _Thread:
         def is_alive(self):
             return False
 
     mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
-    mover.controller = _Controller()
+    controller = _Controller()
+    mover.controller = controller
     mover.ik = object()
     mover._thread = _Thread()
     mover._ibvs_enabled = True
@@ -412,8 +429,9 @@ def test_release_for_operator_drops_sdk_and_keeps_idle_preview():
     mover._scanning.set()
     msg = mover.release_for_operator()
     assert "释放" in msg
-    assert "运控" in msg
-    assert released == [1.2]
+    assert "没有拉起新的控制" in msg
+    assert controller.aborted is True
+    assert controller.released == []
     assert mover.controller is None
     assert mover.ik is not None
     status = mover.status()
@@ -423,6 +441,20 @@ def test_release_for_operator_drops_sdk_and_keeps_idle_preview():
     assert status["phase"] == "released"
     assert status["left_side_ready"] is False
     assert mover.start() == "请先点 Raise/Scan 举臂"
+
+
+def test_release_does_not_restore_the_arm():
+    calls = []
+
+    class _Controller:
+        def apply_arm_rad(self, arm, target, seconds, dt):
+            calls.append((arm, list(target)))
+
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
+    mover.controller = _Controller()
+    mover._stop.set()
+    assert mover._restore_right_joints([0.1] * 7) is False
+    assert calls == []
 
 
 def test_release_when_already_idle_is_safe():
@@ -905,6 +937,29 @@ def test_reset_returns_to_the_ready_pose_without_releasing_sdk():
     assert not mover._return_ready.is_set()
 
 
+def test_sdk_reset_moves_both_arms_together():
+    order = []
+
+    class _Controller:
+        def write_joints(self, updates, weight=1.0, dq=None):
+            return None
+
+        def ramp_arm(self, arm, degrees, seconds, dt):
+            order.append(arm)
+            time.sleep(0.15)
+            order.append((arm, tuple(degrees)))
+
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
+    mover._service_node_probe = lambda: False
+    mover.controller = _Controller()
+    mover._thread = _AliveThread()
+    mover._execute_return_ready()
+    assert order.index("right") < order.index(("left", LEFT_REST_DEG))
+    assert order.index("left") < order.index(("right", REST_DEG))
+    assert ("left", LEFT_REST_DEG) in order
+    assert ("right", REST_DEG) in order
+
+
 def test_direct_pbvs_starts_without_a_prior_raise(monkeypatch):
     import ibvs_pad_touch.web.arm_motion as arm_motion_module
 
@@ -1351,7 +1406,7 @@ def test_direct_pbvs_tries_another_seed_when_the_measured_basin_fails():
 
     class _IK:
         def tip_xyz(self, measured):
-            if controller.moved:
+            if controller.moved or (measured and float(measured[0]) > 1.0):
                 return [0.55, -0.10, 0.46]
             return [0.05, -0.20, -0.30]
 
@@ -2817,12 +2872,10 @@ def test_chest_pose_lowers_when_the_end_effector_is_above_the_button():
     mover._wrist_approach_once({"chest_pose_button_torso_m": [0.48, -0.02, 0.30]})
     assert applied
     step = applied[0][0]
-    assert abs(step[0]) < 1e-9
-    assert abs(step[1]) < 1e-9
-    assert step[2] < 0.0
-    assert abs(step[2]) <= 0.004 + 1e-9
-    assert "偏高" in mover.message
-    assert "降低" in mover.message
+    assert step[0] > 0.0
+    assert abs(step[2]) < 1e-9
+    assert "先对齐" in mover.message
+    assert "先不深入" in mover.message
 
 
 def test_chest_pose_raises_when_the_end_effector_is_below_the_button():
@@ -2876,11 +2929,10 @@ def test_chest_pose_raises_when_the_button_is_above_the_tip_even_if_the_image_lo
         }
     )
     assert applied
-    assert applied[0][0][2] > 0.0
-    assert abs(applied[0][0][2]) <= 0.004 + 1e-9
-    assert abs(applied[0][0][0]) < 1e-9
-    assert "偏低" in mover.message
-    assert "抬高" in mover.message
+    assert applied[0][0][0] > 0.0
+    assert abs(applied[0][0][2]) < 1e-9
+    assert "先对齐" in mover.message
+    assert "先不深入" in mover.message
 
 
 def test_chest_image_lowers_without_button_depth():
@@ -2894,8 +2946,9 @@ def test_chest_image_lowers_without_button_depth():
             "virtual_tip_uv": [220.0, 80.0],
         }
     )
-    assert applied[0][0][2] < 0.0
-    assert "画面" in mover.message
+    assert applied[0][0][0] > 0.0
+    assert abs(applied[0][0][2]) < 1e-9
+    assert "先对齐" in mover.message
 
 
 def test_small_chest_pose_z_gap_lets_the_wrist_keep_approaching():
@@ -3315,17 +3368,33 @@ def test_service_rise_keeps_x_until_the_arm_is_up():
 
 
 def test_forward_step_is_only_x_when_height_and_lateral_are_close():
-    step = pbvs_forward_step((0.0576, 0.0072, -0.0110))
+    step = pbvs_forward_step((0.0576, 0.0072, -0.0080))
     assert step is not None
     assert abs(step[0] - 0.02) < 1e-9
     assert step[1] == 0.0 and step[2] == 0.0
+    assert pbvs_forward_step((0.0131, 0.0181, -0.0173)) is None
     assert pbvs_forward_step((0.0576, 0.05, -0.0110)) is None
     assert pbvs_forward_step((0.005, 0.0072, -0.0110)) is None
     assert pbvs_descent_step((0.05, 0.0, -0.103)) == (0.0, 0.0, -0.02)
-    assert pbvs_descent_step((0.0576, 0.0072, -0.0110)) is None
+    assert pbvs_descent_step((0.0576, 0.0072, -0.008)) is None
+    assert pbvs_descent_step((0.013, 0.0, -0.017)) == (0.0, 0.0, -0.017)
     assert pbvs_lateral_step((0.0086, 0.0323, -0.0117)) == (0.0, 0.02, 0.0)
     assert pbvs_lateral_step((0.0086, 0.005, -0.0117)) is None
     assert pbvs_lateral_step((0.05, 0.0323, -0.0117)) is None
+    # YZ first: X stays put while it is already more than 2 cm short, and backs up when it is not.
+    assert pbvs_yz_align_step((0.0576, 0.0072, -0.0110)) == (0.0, 0.0, -0.0110)
+    assert pbvs_yz_align_step((0.05, 0.0, -0.103)) == (0.0, 0.0, -0.02)
+    held = pbvs_yz_align_step((0.0086, 0.0323, -0.0117))
+    assert held is not None
+    assert abs(held[0] - (0.0086 - 0.02)) < 1e-9
+    assert abs(held[1] - 0.02) < 1e-9
+    assert abs(held[2] + 0.0117) < 1e-9
+    assert pbvs_yz_align_step((0.04, 0.004, -0.003)) is None
+    assert pbvs_yz_hold_goal((0.50, 0.0, 0.40), (0.60, 0.08, 0.40)) == (0.50, 0.08, 0.40)
+    assert pbvs_yz_hold_goal((0.59, 0.0, 0.40), (0.60, 0.08, 0.40)) == (0.58, 0.08, 0.40)
+    assert pbvs_yz_hold_goal((0.50, 0.0, 0.40), (0.60, 0.004, 0.403)) is None
+    assert pbvs_x_step((0.05, 0.03, -0.04)) == (0.02, 0.0, 0.0)
+    assert pbvs_x_step((0.005, 0.03, -0.04)) is None
 
 
 def test_coarse_pbvs_descends_when_the_tip_is_already_above_the_goal():
@@ -3406,7 +3475,6 @@ def test_close_pbvs_raises_when_the_chest_button_is_above_the_tip():
     mover.ik = _IK()
     mover._pbvs_once({"target": "button_1", "target_torso_m": [0.594, -0.070, 0.440]})
     assert deltas == [(0.0, 0.0, 0.004)]
-    assert "偏低" in mover.message
     assert "抬高" in mover.message
 
 
@@ -3497,9 +3565,11 @@ def test_coarse_pbvs_slides_in_y_when_the_chest_button_is_still_beside_the_tip()
     mover.wrist_watch = lambda enabled: (_ for _ in ()).throw(AssertionError("wrist handover"))
     mover._control_stage = "PBVS_COARSE"
     mover._pbvs_once({"target": "button_1", "target_torso_m": [0.5557, 0.0231, 0.4482]})
-    assert deltas == [(0.0, 0.02, 0.0)]
+    assert len(deltas) == 1
+    assert deltas[0][0] == 0.0 and deltas[0][1] == 0.0
+    assert abs(deltas[0][2] + 0.0117) < 1e-9
     assert mover._control_stage == "PBVS_COARSE"
-    assert "Y 方向" in mover.message
+    assert "下降" in mover.message
 
 
 def test_coarse_pbvs_hands_the_live_button_to_the_wrist_when_the_lock_is_still_aside():
@@ -3639,7 +3709,7 @@ def test_coarse_pbvs_backs_out_before_the_preapproach_plane():
 def test_coarse_forward_stops_short_of_the_preapproach_plane():
     deltas = []
     button_x = 0.5417
-    tip_x = 0.5300
+    tip = [0.5300, 0.0134, 0.4205]
 
     class _Controller:
         def commanded_arm_rad(self, arm):
@@ -3653,10 +3723,11 @@ def test_coarse_forward_stops_short_of_the_preapproach_plane():
 
     class _IK:
         def tip_xyz(self, q, offset=(0.205, 0.0, 0.0)):
-            return (tip_x, 0.0134, 0.4205)
+            return tuple(tip)
 
         def apply_tip_delta(self, q, dxyz, posture):
             deltas.append(tuple(float(value) for value in dxyz))
+            tip[0] += float(dxyz[0])
             return list(q), True, 0.0, 0.01
 
         def apply_loaded_tool_pose_target(self, *args, **kwargs):
@@ -3670,8 +3741,8 @@ def test_coarse_forward_stops_short_of_the_preapproach_plane():
     step = deltas[0]
     assert step[1] == 0.0 and step[2] == 0.0
     assert step[0] > 0.0
-    assert tip_x + step[0] < coarse_x_ceiling(button_x)
-    assert abs((tip_x + step[0]) - coarse_x_command(button_x)) < 1e-9
+    assert 0.5300 + step[0] < coarse_x_ceiling(button_x)
+    assert abs((0.5300 + step[0]) - coarse_x_command(button_x)) < 1e-9
 
 
 def test_coarse_pose_goal_stays_short_of_the_preapproach_plane():
@@ -3718,6 +3789,54 @@ def test_coarse_pose_goal_stays_short_of_the_preapproach_plane():
     assert abs(asked[0][2] - button[2]) < 1e-9
 
 
+def test_coarse_pbvs_poses_yz_when_the_translation_is_rejected():
+    deltas = []
+    asked = []
+    tip = [0.5744, -0.1626, 0.2849]
+    button = (0.5881, -0.1205, 0.3971)
+
+    class _Controller:
+        def commanded_arm_rad(self, arm):
+            return [0.1] * 7
+
+        def measured_arm_rad(self, arm):
+            return [0.1] * 7
+
+        def apply_arm_rad(self, arm, q, seconds, dt):
+            return None
+
+    class _IK:
+        def tip_xyz(self, q, offset=(0.205, 0.0, 0.0)):
+            if asked and abs(float(q[0]) - 0.2) < 1e-9:
+                return asked[-1]
+            return tuple(tip)
+
+        def apply_tip_delta(self, q, dxyz, posture):
+            deltas.append(tuple(float(value) for value in dxyz))
+            return list(q), False, 0.0001, 0.0
+
+        def solve_loaded_tool_pose(self, commanded, measured, **kwargs):
+            asked.append(tuple(float(value) for value in kwargs["target_tool_xyz_m"]))
+            return {
+                "q_command": [0.2] * 7,
+                "q_solved": [0.2] * 7,
+                "pos_err": 0.001,
+                "ori_err": 0.01,
+            }
+
+        def apply_loaded_tool_pose_target(self, *args, **kwargs):
+            raise AssertionError("a rejected translation must use solve_loaded_tool_pose")
+
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
+    mover.controller = _Controller()
+    mover.ik = _IK()
+    mover._pbvs_once({"target": "button_1", "target_torso_m": list(button)})
+    assert asked
+    assert abs(asked[0][0] - coarse_x_command(button[0])) < 1e-9
+    assert abs(asked[0][1] - button[1]) < 1e-9
+    assert abs(asked[0][2] - button[2]) < 1e-9
+
+
 def test_coarse_pbvs_walks_forward_instead_of_resolving_the_pose():
     deltas = []
 
@@ -3746,10 +3865,11 @@ def test_coarse_pbvs_walks_forward_instead_of_resolving_the_pose():
     mover.controller = _Controller()
     mover.ik = _IK()
     mover._pbvs_once({"target": "button_1", "target_torso_m": [0.5696, -0.0753, 0.4369]})
-    assert deltas == [(0.02, 0.0, 0.0)]
-    assert mover._forward_hold is True
-    assert "向前" in mover.message
-    assert "58" in mover.message or "57" in mover.message
+    assert len(deltas) == 1
+    assert abs(deltas[0][0]) < 1e-9 and abs(deltas[0][1]) < 1e-9
+    assert abs(deltas[0][2] + 0.011) < 1e-9
+    assert "下降" in mover.message
+    assert "11" in mover.message
 
 
 def test_pbvs_lowers_when_the_chest_still_sees_the_button_above_the_gripper():
@@ -4108,7 +4228,7 @@ def test_sequence_next_on_the_last_button_lowers_and_releases():
     assert mover._control_stage == "RELEASED"
 
 
-def test_sequence_next_after_a_missed_contact_resumes_the_following_button():
+def test_sequence_goes_to_the_next_button_when_one_press_does_not_arrive():
     calls = []
     buttons = {
         "button_1": [0.40, 0.10, 0.20],
@@ -4164,15 +4284,11 @@ def test_sequence_next_after_a_missed_contact_resumes_the_following_button():
     mover._run_hybrid_button = shoot
     mover._run_button_sequence()
     assert [item for item in calls if isinstance(item, tuple) and item[0] == "shoot"] == [
-        ("shoot", "button_1")
-    ]
-    assert mover._control_stage == "HOLD"
-    assert "Button2" in mover.advance_sequence()
-    mover._servo_once()
-    assert [item for item in calls if isinstance(item, tuple) and item[0] == "shoot"] == [
+        ("shoot", "button_1"),
         ("shoot", "button_1"),
         ("shoot", "button_2"),
     ]
+    assert mover._control_stage == "RELEASED"
     assert ("clear", sequence_clear_goal((0.50, 0.08, 0.42))) in calls
     assert mover.phase == "released"
 
@@ -4199,7 +4315,7 @@ def test_sequence_finish_stops_the_service_when_that_backend_is_active():
     assert mover._stop.is_set()
 
 
-def test_button_sequence_stops_when_the_wrist_camera_does_not_see_contact():
+def test_button_sequence_continues_when_a_press_does_not_arrive():
     calls = []
     buttons = {
         "button_1": [0.40, 0.10, 0.20],
@@ -4224,9 +4340,43 @@ def test_button_sequence_stops_when_the_wrist_camera_does_not_see_contact():
     captured = []
     mover.on_screen_capture = lambda: captured.append(True)
     mover._run_button_sequence()
-    assert calls == ["button_1"]
-    assert captured == []
-    assert "右腕" in mover.message
+    assert [item for item in calls if isinstance(item, str)] == [
+        "button_1",
+        "button_1",
+        "button_1",
+        "button_1",
+        "button_2",
+        "button_2",
+        "button_2",
+        "button_2",
+    ]
+    assert "超过 3 次" in mover.message or mover.phase == "released"
+    assert mover.phase == "released"
+    assert mover._control_stage == "RELEASED"
+
+
+def test_hybrid_button_treats_an_ik_rejection_as_not_arrived():
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
+
+    def once(_telem):
+        mover.message = "IK 拒绝 这一步 -0.1 0.0 0.0 mm，解算剩余 0.1 mm，关节 0.0°"
+        mover._forward_hold = True
+        mover._control_stage = "PBVS_COARSE"
+
+    mover._pbvs_once = once
+    assert mover._run_hybrid_button("button_1", (0.40, 0.10, 0.20)) is False
+
+
+def test_three_millimetres_past_the_button_is_not_arrival():
+    assert direct_pbvs_arrived((-0.003, -0.0004, -0.001)) is False
+    assert direct_pbvs_arrived((0.001, -0.005, 0.0)) is False
+    assert direct_pbvs_arrived((0.001, -0.001, 0.0)) is True
+
+
+def test_a_lagging_arm_keeps_the_press_going():
+    assert direct_pbvs_round_stalled(0.040, 0.040, math.radians(6.0)) is False
+    assert direct_pbvs_round_stalled(0.040, 0.040, math.radians(0.4)) is True
+    assert direct_pbvs_round_stalled(0.001, 0.020, math.radians(6.0)) is True
 
 
 def test_dashboard_start_message_mentions_flag_in_demo():

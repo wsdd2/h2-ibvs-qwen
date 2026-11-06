@@ -25,6 +25,7 @@ def test_eye_in_hand_error_moves_the_camera_toward_the_button():
     )
     assert right["camera_step_m"][0] > 0.0
     assert abs(right["camera_step_m"][1]) < 1e-6
+    assert right["camera_step_m"][2] == 0.0
     far = eye_in_hand_ibvs_step(
         (320.0, 240.0),
         (320.0, 240.0),
