@@ -683,6 +683,8 @@ class LiveIbvsAnnotator:
         detector=None,
         ignore_gripper: bool = False,
         async_preview: bool = False,
+        use_onnx: bool = False,
+        use_rknn: bool = False,
     ) -> None:
         self.ignore_gripper = bool(ignore_gripper)
         if self.ignore_gripper:
@@ -779,8 +781,13 @@ class LiveIbvsAnnotator:
             self.detector = detector
             self.wrist_detector = detector
         elif use_yolo:
-            self.detector = YoloTouchDetector(name="chest")
-            self.wrist_detector = YoloTouchDetector(name="wrist", cpu_pose=True)
+            self.detector = YoloTouchDetector(name="chest", use_onnx=use_onnx, use_rknn=use_rknn)
+            self.wrist_detector = YoloTouchDetector(
+                name="wrist",
+                cpu_pose=True,
+                use_onnx=use_onnx,
+                use_rknn=use_rknn,
+            )
             self.detector._ensure()
             self.wrist_detector._ensure()
         else:
@@ -1533,6 +1540,7 @@ class LiveIbvsAnnotator:
                     self._annotate_right_wrist(frame)
             except Exception as exc:
                 print(f"[ibvs-yolo] {camera} {exc}", flush=True)
+                self._stash_view(camera, ("error", f"{camera} pose failed: {exc}"))
 
     def _stash_view(self, name: str, payload) -> None:
         with self._infer_guard:
@@ -1543,6 +1551,19 @@ class LiveIbvsAnnotator:
             pack = self._preview.get(name)
         if not pack:
             return bgr
+        if pack[0] == "error":
+            vis = bgr.copy()
+            cv2.putText(
+                vis,
+                str(pack[1])[:90],
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            return vis
         if pack[0] == "chest":
             return self._paint_chest_view(bgr, pack)
         if pack[0] == "wrist":

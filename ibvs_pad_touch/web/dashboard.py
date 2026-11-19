@@ -36,14 +36,19 @@ COMMANDS = {
     "sequence_next",
     "sequence_direct_pbvs",
     "sequence_hybrid",
+    "sequence_llm_hybrid",
+    "trial_toggle",
+    "trial_finish",
     "pause",
     "stop",
     "release",
     "reset",
     "mode_direct_pbvs",
     "mode_hybrid",
+    "mode_llm_hybrid",
     "backend_arm_sdk",
     "backend_service",
+    "backend_custom_sdk",
     "left_index",
     "left_open",
     "left_stop",
@@ -476,6 +481,8 @@ class RealRobotDashboard:
         right_ee: str = "dex1",
         records_port: int = 8082,
         revo2_bridge: str = "",
+        use_onnx: bool = False,
+        use_rknn: bool = False,
     ) -> None:
         cam = load_camera_config()["camera"]
         self.host = host
@@ -525,6 +532,8 @@ class RealRobotDashboard:
                 eye_to_hand_z_bias_m=eye_to_hand_z_bias_m,
                 ignore_gripper=self.right_ee == "revo2",
                 async_preview=not demo,
+                use_onnx=use_onnx,
+                use_rknn=use_rknn,
             )
         except Exception as exc:
             self.ibvs = None
@@ -575,6 +584,9 @@ class RealRobotDashboard:
             self.arm.read_screen = self._read_screen_bgr
             self.arm.on_select_target = self.ibvs.set_target
             self.arm.on_reidentify = self.ibvs.forget_button_lock
+        wrist_cam = self.cameras.get("d435i")
+        if wrist_cam is not None:
+            self.arm.wrist_jpeg = wrist_cam.raw_jpeg
         self._screen_jpeg: bytes | None = None
         self._screen_at = 0.0
         self._app = Flask(__name__)
@@ -708,6 +720,12 @@ class RealRobotDashboard:
                 self._message = self.arm.set_sequence_mode("direct_pbvs")
             elif command == "sequence_hybrid":
                 self._message = self.arm.set_sequence_mode("hybrid")
+            elif command == "sequence_llm_hybrid":
+                self._message = self.arm.set_sequence_mode("llm_hybrid")
+            elif command == "trial_toggle":
+                self._message = self.arm.set_trial_press(not bool(self.arm.status().get("trial_press")))
+            elif command == "trial_finish":
+                self._message = self.arm.finish_trial()
             elif command in {"pause", "stop"}:
                 self._running = False
                 self._message = self.arm.pause()
@@ -726,14 +744,14 @@ class RealRobotDashboard:
                 self._message = self.arm.set_servo_mode("direct_pbvs")
             elif command == "mode_hybrid":
                 self._message = self.arm.set_servo_mode("hybrid")
+            elif command == "mode_llm_hybrid":
+                self._message = self.arm.set_servo_mode("llm_hybrid")
             elif command == "backend_arm_sdk":
                 self._message = self.arm.set_motion_backend("arm_sdk")
             elif command == "backend_service":
                 self._message = self.arm.set_motion_backend("service")
-            elif command in {"left_index", "left_open", "left_stop", "right_press", "right_open", "right_stop"}:
-                self._message = hand_message
-            elif command == "redetect_finger":
-                if self.ibvs is None or not hasattr(self.ibvs, "recapture_finger_tip"):
+            elif command == "backend_custom_sdk":
+                self._message = self.arm.set_motion_backend("custom_sdk")
                     self._message = "右腕画面未加载，不能重新检测指尖"
                 else:
                     self._message = self.ibvs.recapture_finger_tip()
@@ -1090,6 +1108,22 @@ class RealRobotDashboard:
         def eye_to_hand_bias() -> Response:
             payload = request.get_json(silent=True) or {}
             try:
+        @self._app.post("/task_landing_bias")
+        def task_landing_bias() -> Response:
+            payload = request.get_json(silent=True) or {}
+            try:
+                x_m = float(payload.get("x_m"))
+                y_m = float(payload.get("y_m"))
+                z_m = float(payload.get("z_m"))
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "x_m y_m z_m 需要是数字，单位 m"}), 400
+            message = self.arm.set_task_landing_bias(x_m, y_m, z_m)
+            bias = self.arm.status().get("task_landing_bias_m") or {}
+            accepted = abs(float(bias.get("x", 0.0)) - x_m) < 1e-6 and abs(float(bias.get("y", 0.0)) - y_m) < 1e-6 and abs(float(bias.get("z", 0.0)) - z_m) < 1e-6
+            if not accepted:
+                return jsonify({"ok": False, "error": message}), 409
+            return jsonify({"ok": True, "task_landing_bias_m": bias, "message": message})
+
                 x_m = float(payload.get("x_m"))
                 y_m = float(payload.get("y_m"))
                 z_m = float(payload.get("z_m"))
@@ -1357,7 +1391,7 @@ PAGE_HTML = """<!doctype html>
     <div class="controls">
       <button class="b1" data-cmd="button_1" onclick="send('button_1',this)">Button 1</button>
       <button class="b2" data-cmd="button_2" onclick="send('button_2',this)">Button 2</button>
-      <button class="b3" data-cmd="button_3" onclick="send('button_3',this)">Button 3</button>
+    <div class="hint">Hybrid VS：胸口 PBVS 粗定位，右腕图像 IBVS 把按钮对准夹爪尖后进近，并由右腕视觉确认接触。LLM Hybrid：同样先胸口 PBVS，末端改由远程 LLM 看右腕画面发小步位移；启动前会检查 LLM 连接（超时 60s，不含推理时间）。选择按钮后 Start；No Raise required。arm_sdk 和 h2_arm_service_node 均保留；运动中不要切换控制链路，only after Release 才切换正在占用的链路。Reset 和 Ctrl+C 会放下双臂。</div>
       <button class="cycle" data-cmd="cycle" onclick="send('cycle',this)">Cycle</button>
       <button class="mode" data-cmd="mode_direct_pbvs" onclick="send('mode_direct_pbvs',this)">Direct PBVS</button>
       <button class="mode" data-cmd="mode_hybrid" onclick="send('mode_hybrid',this)">Hybrid VS</button>
@@ -1365,6 +1399,7 @@ PAGE_HTML = """<!doctype html>
       <button class="mode" data-cmd="left_index" onclick="send('left_index',this)" title="左手食指伸直，其余收紧。只发左手">左手食指</button>
       <button class="mode" data-cmd="left_open" onclick="send('left_open',this)" title="左手五指张开">左手张开</button>
       <button class="mode" data-cmd="left_stop" onclick="send('left_stop',this)" title="停止向左手发送">左手停止</button>
+      <button class="mode" data-cmd="mode_llm_hybrid" onclick="send('mode_llm_hybrid',this)">LLM Hybrid</button>
       <span id="revo2Status" class="hint">左手未发送</span>
       <button class="mode" data-cmd="right_press" onclick="send('right_press',this)" title="只发右手，不举臂。姿势取已保存的 revo2_test.yaml 里的 test_pose">右手预备</button>
       <button class="mode" data-cmd="right_open" onclick="send('right_open',this)" title="只张开右手">右手张开</button>
@@ -1378,6 +1413,7 @@ PAGE_HTML = """<!doctype html>
       <button class="scan" data-cmd="level_right" onclick="send('level_right',this)" title="已关闭，不会动右臂">Right level off</button>
       <button class="snap" onclick="captureStill()">截图</button>
       <button class="start" data-cmd="start" onclick="send('start',this)">Start</button>
+      <button class="mode" data-cmd="backend_custom_sdk" onclick="send('backend_custom_sdk',this)" title="自定义运控上肢。不发 rt/arm_sdk，改发 /upper_body_joint_command">Custom_SDK</button>
       <button class="start" data-cmd="start_sequence" onclick="send('start_sequence',this)">组合启动</button>
       <button class="estop" data-cmd="estop" onclick="send('estop',this)">急停</button>
       <button class="stop" data-cmd="pause" onclick="send('pause',this)">Pause / 细调</button>
@@ -1456,14 +1492,24 @@ PAGE_HTML = """<!doctype html>
         <button type="button" onclick="addSequence('button_2')">+ Button 2</button>
         <button type="button" onclick="addSequence('button_3')">+ Button 3</button>
         <button type="button" class="danger" onclick="clearSequence()">清空</button>
+        <button type="button" class="mode" data-cmd="sequence_llm_hybrid" onclick="send('sequence_llm_hybrid', this)">LLM Hybrid</button>
         <button type="button" onclick="send('sequence_next', this)">Next Step</button>
       </div>
       <ol class="sequence-list" id="sequenceList"></ol>
       <div class="hint">拖动排序，可以重复。先选 Direct PBVS 或 Hybrid，再点上面的「组合启动」。Direct PBVS 每颗一次到位；Hybrid 是胸口 PBVS 再右腕进近。组合为空会报错。Start 仍只按当前选中的一颗，并使用上面的模式按钮。做完一个动作后，右臂向下、向右移出面板，胸口重新识别，再做下一颗。已经按到但没检测到时，点 Next Step 会立刻移开手臂并进入下一颗；已经是最后一颗则放下右臂并释放控制。读取屏幕判断进度默认关闭。打开后，组合和单次 Start 都会在第一下之前截屏，每按一次再截屏：屏幕变了就输出黑块，没变就重做刚才那一下，最多三次。</div>
+        <button type="button" class="mode" id="trialToggle" data-cmd="trial_toggle" onclick="send('trial_toggle', this)">试按关</button>
+        <button type="button" onclick="send('trial_finish', this)">试按完成</button>
     </div>
     <div id="pills"></div>
+      <form id="task-bias-form" class="bias-form" onsubmit="submitTaskBias(event)">
+        <label>本轮 X<input id="task-bias-x" type="number" step="0.001" value="0"></label>
+        <label>Y<input id="task-bias-y" type="number" step="0.001" value="0"></label>
+        <label>Z<input id="task-bias-z" type="number" step="0.001" value="0"></label>
+        <button type="submit">提交本轮落点</button>
+        <span id="task-bias-status"></span>
+      </form>
     <div class="hint" id="message">loading…</div>
-    <pre id="actionPose">动作结束坐标：尚无</pre>
+      <div class="hint">同一轮组合里，同一颗键第一次按视觉走，再出现就回放那次落点，不再重新识别。本轮落点是躯干坐标的临时 XYZ，单位 m，加在这一轮的落点上，每轴 ±50 mm；组合结束、释放或急停后清零，不改启动时的手眼 bias。试按打开时，组合启动只按第一颗后停住，可改本轮落点再点试按完成。拖动排序，可以重复。先选 Direct PBVS、Hybrid 或 LLM Hybrid，再点上面的「组合启动」。LLM Hybrid 启动前会检查远程 LLM 连接（超时 60s，不含推理）。做完一个动作后，右臂向下、向右移出面板，再做下一颗。已经按到但没检测到时，点 Next Step 会立刻移开手臂并进入下一颗；已经是最后一颗则放下右臂并释放控制。</div>
     <div class="coord-panel">
       <h3>目标 / right_ee_link（Torso_Link 坐标）</h3>
       <table>
@@ -1665,7 +1711,7 @@ function renderSequence(){
   const names=sequenceSteps.length?sequenceSteps.map(name=>SEQUENCE_LABELS[name]||name).join(' → '):'空';
   if(status) status.textContent=modeLabel+' · '+names;
   if(!list) return;
-  list.innerHTML=sequenceSteps.map((name,index)=>`
+  const modeLabel=sequenceMode==='direct_pbvs'?'Direct PBVS':(sequenceMode==='llm_hybrid'?'LLM Hybrid':'Hybrid');
     <li draggable="true" data-index="${index}">
       <span>${index+1}. ${SEQUENCE_LABELS[name]||name}</span>
       <button type="button" onclick="removeSequence(${index})">×</button>
@@ -1749,6 +1795,41 @@ async function submitEyeBias(ev){
   ev.preventDefault();
   const status=document.getElementById('bias-status');
   const body={
+function fillTaskBias(state){
+  const bias=state.arm && state.arm.task_landing_bias_m;
+  if(!bias) return;
+  const ids=['task-bias-x','task-bias-y','task-bias-z'];
+  if(ids.some(id=>document.activeElement && document.activeElement.id===id)) return;
+  const x=document.getElementById('task-bias-x');
+  const y=document.getElementById('task-bias-y');
+  const z=document.getElementById('task-bias-z');
+  if(!x||!y||!z) return;
+  x.value=bias.x;
+  y.value=bias.y;
+  z.value=bias.z;
+}
+async function submitTaskBias(ev){
+  ev.preventDefault();
+  const status=document.getElementById('task-bias-status');
+  const body={
+    x_m:Number(document.getElementById('task-bias-x').value),
+    y_m:Number(document.getElementById('task-bias-y').value),
+    z_m:Number(document.getElementById('task-bias-z').value),
+  };
+  const res=await fetch('/task_landing_bias',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)
+  });
+  const data=await res.json();
+  if(!status) return;
+  status.textContent=data.ok?'本轮已提交':(data.error||'提交失败');
+  refresh();
+}
+async function submitEyeBias(ev){
+  ev.preventDefault();
+  const status=document.getElementById('bias-status');
+  const body={
     x_m:Number(document.getElementById('bias-x').value),
     y_m:Number(document.getElementById('bias-y').value),
     z_m:Number(document.getElementById('bias-z').value),
@@ -1771,7 +1852,7 @@ async function submitEyeBias(ev){
 async function send(command, btn){
   const slot=document.getElementById('message');
   const handHints={left_index:'正在发送左手食指…',left_open:'正在张开左手…',left_stop:'正在停止左手…',right_press:'正在发送右手预备…',right_open:'正在张开右手…',right_stop:'正在停止右手…'};
-  if(slot) slot.textContent=command==='backend_arm_sdk'?'正在拉起 arm_sdk…':(handHints[command]||('已点击 '+command));
+  if(slot) slot.textContent=command==='backend_arm_sdk'?'正在拉起 arm_sdk…':(command==='backend_custom_sdk'?'正在切换 Custom_SDK…':(handHints[command]||('已点击 '+command)));
   if(btn) btn.classList.add('active');
   try{
     const res=await fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command})});
@@ -1946,8 +2027,8 @@ async function refresh(){
       `arm:${(s.arm&&s.arm.phase)||'idle'}`,
       `ibvs:${s.arm&&s.arm.ibvs_enabled?'on':'off'}`,
       `stage:${(s.arm&&s.arm.control_stage)||'IDLE'}`,
-      `mode:${s.arm?.servo_mode==='direct_pbvs'?'PBVS-DIRECT':(s.arm?.servo_mode==='hybrid'?'HYBRID-VS':(s.arm?.servo_mode==='direct_ee'?'DIRECT-EE':'DUAL-IBVS'))}`,
-      `link:${s.arm?.motion_backend==='service'?'service':'arm_sdk'}`,
+      `mode:${s.arm?.servo_mode==='direct_pbvs'?'PBVS-DIRECT':(s.arm?.servo_mode==='llm_hybrid'?'LLM-HYBRID':(s.arm?.servo_mode==='hybrid'?'HYBRID-VS':(s.arm?.servo_mode==='direct_ee'?'DIRECT-EE':'DUAL-IBVS')))}`,
+      `link:${s.arm?.motion_backend==='service'?'service':(s.arm?.motion_backend==='custom_sdk'?'Custom_SDK':'arm_sdk')}`,
       `revo2:${s.revo2_left?.holding?(s.revo2_left.name||'hold'):(s.revo2_left?.error?'offline':'wait')}`,
       `right:${s.arm?.right_ee||'dex1'}${s.revo2_right?.holding?':'+s.revo2_right.name:(s.revo2_right?.error?':offline':'')}`,
       `gravity:${s.arm&&s.arm.gravity?'on':'off'}`,
@@ -1999,7 +2080,7 @@ async function refresh(){
       renderSequence();
     }else{
       const sequenceStatus=document.getElementById('sequence-status');
-      const modeLabel=sequenceMode==='direct_pbvs'?'Direct PBVS':'Hybrid';
+      const modeLabel=sequenceMode==='direct_pbvs'?'Direct PBVS':(sequenceMode==='llm_hybrid'?'LLM Hybrid':'Hybrid');
       const names=sequenceSteps.length?sequenceSteps.map(name=>SEQUENCE_LABELS[name]||name).join(' → '):'空';
       if(sequenceStatus) sequenceStatus.textContent=modeLabel+' · '+names;
     }
@@ -2042,10 +2123,7 @@ async function refresh(){
     document.getElementById('world-error-xyz').textContent=worldError ? worldError.map(v=>num(v,4)).join('  ') : '—';
     document.getElementById('world-ee-rpy').textContent=arm.right_ee_rpy_deg ? arm.right_ee_rpy_deg.map(v=>num(v,2)).join('  ') : '—';
     fillEyeBias(s);
-    const trajectory=s.trajectory||{};
-    document.getElementById('trajectory-status').textContent=arm.playback
-      ? `回放 ${arm.playback_id||''} ×${num(arm.playback_speed,1)}`
-      : (trajectory.recording ? `录制中 ${trajectory.samples||0}帧` : (trajectory.id?`已保存 ${trajectory.id}`:'未录制'));
+    fillTaskBias(s);
     const rows = (s.upper_body?.joints||[]).map(j=>
       `<tr><td>${j.label} <span style="color:#666">${j.index}</span></td><td>${num(j.q,4)}</td><td>${num(j.q_deg,1)}</td><td>${num(j.dq,3)}</td></tr>`
     ).join('');
@@ -2073,9 +2151,17 @@ async function refresh(){
     else document.querySelector('button[data-cmd="sequence_hybrid"]')?.classList.add('active');
     if(s.arm?.motion_backend==='service') document.querySelector('button[data-cmd="backend_service"]')?.classList.add('active');
     else if(s.arm?.sdk_active || String(s.arm?.message||'').indexOf('正在拉起 arm_sdk')===0) document.querySelector('button[data-cmd="backend_arm_sdk"]')?.classList.add('active');
-    const hand=s.revo2_left||{};
+    if(s.arm?.servo_mode==='llm_hybrid') document.querySelector('button[data-cmd="mode_llm_hybrid"]')?.classList.add('active');
+    const trial=document.getElementById('trialToggle');
+    if(trial){
+      trial.textContent=s.arm?.trial_press?'试按开':'试按关';
+      trial.classList.toggle('active', !!s.arm?.trial_press);
+    }
+    if(s.arm?.sequence_mode==='direct_pbvs') document.querySelector('button[data-cmd="sequence_direct_pbvs"]')?.classList.add('active');
+    else if(s.arm?.sequence_mode==='llm_hybrid') document.querySelector('button[data-cmd="sequence_llm_hybrid"]')?.classList.add('active');
     const hq=hand.command||[];
     const indexPose=hq.length===6 && hq[2]===0 && hq.every((v,i)=>i===2 ? v===0 : v===1);
+    else if(s.arm?.motion_backend==='custom_sdk') document.querySelector('button[data-cmd="backend_custom_sdk"]')?.classList.add('active');
     const openPose=hq.length===6 && hq.every(v=>v===0);
     if(hand.holding && indexPose) document.querySelector('button[data-cmd="left_index"]')?.classList.add('active');
     if(hand.holding && openPose) document.querySelector('button[data-cmd="left_open"]')?.classList.add('active');

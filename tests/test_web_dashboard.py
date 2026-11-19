@@ -272,6 +272,7 @@ def test_flask_page_has_reserved_buttons_and_state():
     assert "dx dy dz" in html
     assert "Direct PBVS" in html
     assert "Hybrid VS" in html
+    assert "LLM Hybrid" in html
     assert "backend_arm_sdk" in html
     assert "left_index" in html
     assert "左手食指" in html
@@ -284,6 +285,8 @@ def test_flask_page_has_reserved_buttons_and_state():
     assert "左手侧视" in html
     assert "mode_direct_pbvs" in html
     assert "mode_hybrid" in html
+    assert "mode_llm_hybrid" in html
+    assert "sequence_llm_hybrid" in html
     assert 'id="recordToggle"' in html
     assert "录制关" in html
     assert "No Raise required" in html
@@ -384,6 +387,8 @@ def test_flask_page_has_reserved_buttons_and_state():
         "reset",
         "mode_direct_pbvs",
         "mode_hybrid",
+        "mode_llm_hybrid",
+        "sequence_llm_hybrid",
     }
     selected = client.post("/command", json={"command": "mode_direct_pbvs"}).get_json()
     assert selected["ok"]
@@ -391,6 +396,12 @@ def test_flask_page_has_reserved_buttons_and_state():
     hybrid = client.post("/command", json={"command": "mode_hybrid"}).get_json()
     assert hybrid["ok"]
     assert "Hybrid VS" in (hybrid["state"]["message"] or "")
+    llm = client.post("/command", json={"command": "mode_llm_hybrid"}).get_json()
+    assert llm["ok"]
+    assert "LLM Hybrid" in (llm["state"]["message"] or "")
+    seq_llm = client.post("/command", json={"command": "sequence_llm_hybrid"}).get_json()
+    assert seq_llm["ok"]
+    assert "LLM Hybrid" in (seq_llm["state"]["message"] or "")
     for worker in dash.cameras.values():
         worker.stop()
 

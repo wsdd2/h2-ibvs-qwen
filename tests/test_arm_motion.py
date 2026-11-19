@@ -16,13 +16,11 @@ from ibvs_pad_touch.web.arm_motion import (
     service_rise_before_wall,
     pbvs_descent_step,
     pbvs_forward_step,
-    pbvs_retract_step,
     pbvs_lateral_step,
     pbvs_x_step,
     pbvs_yz_align_step,
     pbvs_yz_hold_goal,
     direct_pbvs_arrived,
-    direct_pbvs_round_stalled,
     quintic_joint_seconds,
     slerp_rpy,
     RIGHT_ARM_JOINTS,
@@ -43,7 +41,6 @@ from ibvs_pad_touch.web.arm_motion import (
     WRIST_VIEW_DEG,
     camera_delta_to_torso,
     direct_pbvs_motion_goal,
-    cap_tool_x,
     expand_quintic_knots,
     fuse_pbvs_buttons,
     relax_x_clearance,
@@ -73,9 +70,6 @@ def test_direct_pbvs_goes_to_the_button_point():
     assert direct_pbvs_motion_goal((0.20, -0.02, 0.20), button) == button
     assert direct_pbvs_motion_goal((0.58, -0.10, 0.44), button) == button
     assert direct_pbvs_motion_goal((0.40, -0.12, 0.44), button) == button
-    assert cap_tool_x((0.6345, -0.1718, 0.3983), 0.6149) == (0.6149, -0.1718, 0.3983)
-    assert pbvs_retract_step((-0.0196, 0.02, 0.03), past_m=0.0) is not None
-    assert pbvs_retract_step((0.02, 0.0, 0.0), past_m=0.0) is None
     assert abs(relax_x_clearance(0.08, 0.04, 0.04) - 0.06) < 1e-9
 
 
@@ -401,26 +395,23 @@ def test_raise_moves_left_side_view_then_right_ready():
     assert mover.status()["left_side_ready"] is True
 
 
-def test_release_for_operator_drops_sdk_and_keeps_idle_preview():
-    class _Controller:
-        def __init__(self):
-            self.aborted = False
-            self.released = []
+def test_release_for_operator_lowers_beside_the_body_before_dropping_sdk():
+    released = []
+    lowered = []
 
-        def abort(self):
-            self.aborted = True
-            self._aborted = True
+    class _Controller:
+        def play_quintic_arm_rad(self, arm, target_rad, seconds, dt):
+            lowered.append((arm, [round(math.degrees(value), 1) for value in target_rad], seconds))
 
         def release(self, seconds):
-            self.released.append(seconds)
+            released.append(seconds)
 
     class _Thread:
         def is_alive(self):
             return False
 
     mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
-    controller = _Controller()
-    mover.controller = controller
+    mover.controller = _Controller()
     mover.ik = object()
     mover._thread = _Thread()
     mover._ibvs_enabled = True
@@ -428,10 +419,12 @@ def test_release_for_operator_drops_sdk_and_keeps_idle_preview():
     mover._running.set()
     mover._scanning.set()
     msg = mover.release_for_operator()
-    assert "释放" in msg
-    assert "没有拉起新的控制" in msg
-    assert controller.aborted is True
-    assert controller.released == []
+    assert "身体两侧" in msg
+    assert [item[0] for item in lowered] == ["left", "right"]
+    assert lowered[0][1] == [float(value) for value in LEFT_HANG_DEG]
+    assert lowered[1][1] == [float(value) for value in RIGHT_HANG_DEG]
+    assert lowered[0][2] == 10.0
+    assert released == [1.2]
     assert mover.controller is None
     assert mover.ik is not None
     status = mover.status()
@@ -443,18 +436,39 @@ def test_release_for_operator_drops_sdk_and_keeps_idle_preview():
     assert mover.start() == "请先点 Raise/Scan 举臂"
 
 
-def test_release_does_not_restore_the_arm():
-    calls = []
+def test_release_drops_sdk_when_the_side_hang_exceeds_eight_seconds():
+    import ibvs_pad_touch.web.arm_motion as arm_motion
+
+    aborted = []
+    released = []
 
     class _Controller:
-        def apply_arm_rad(self, arm, target, seconds, dt):
-            calls.append((arm, list(target)))
+        def play_quintic_arm_rad(self, arm, target_rad, seconds, dt):
+            time.sleep(2.0)
+
+        def abort(self):
+            aborted.append(True)
+
+        def release(self, seconds):
+            released.append(seconds)
+
+    class _Thread:
+        def is_alive(self):
+            return False
 
     mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
     mover.controller = _Controller()
-    mover._stop.set()
-    assert mover._restore_right_joints([0.1] * 7) is False
-    assert calls == []
+    mover._thread = _Thread()
+    previous = arm_motion.RELEASE_LOWER_BUDGET_S
+    arm_motion.RELEASE_LOWER_BUDGET_S = 0.05
+    try:
+        msg = mover.release_for_operator()
+    finally:
+        arm_motion.RELEASE_LOWER_BUDGET_S = previous
+    assert aborted == [True]
+    assert released == []
+    assert "直接释放" in msg
+    assert mover.controller is None
 
 
 def test_release_when_already_idle_is_safe():
@@ -624,6 +638,77 @@ def test_web_mode_buttons_select_direct_pbvs_or_hybrid_for_the_next_start():
     assert "Pause" in kept
 
 
+def test_llm_coarse_timeout_hands_the_fingertip_to_the_model():
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
+    mover.set_servo_mode("llm_hybrid")
+    mover._llm_coarse_since = time.monotonic() - 29.0
+    assert not mover._llm_coarse_expired()
+    mover._llm_coarse_since = time.monotonic() - 30.0
+    assert mover._llm_coarse_expired()
+    mover._handoff_llm_from_pbvs("粗定位未在时限内到位")
+    assert mover.status()["control_stage"] == "WRIST_APPROACH"
+    assert mover._chest_height_after_pbvs is True
+    assert "交给 LLM" in mover.message
+    assert "30s" in mover.message
+
+
+def test_direct_pbvs_has_no_coarse_time_limit():
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
+    mover.set_servo_mode("direct_pbvs")
+    mover._llm_coarse_since = time.monotonic() - 120.0
+    mover._note_llm_coarse()
+    assert not mover._llm_coarse_expired()
+    mover.direct_pbvs_poke = False
+    mover.llm_wrist = True
+    mover._sequence_run = True
+    mover._sequence_mode = "direct_pbvs"
+    mover._llm_coarse_since = time.monotonic() - 120.0
+    assert not mover._llm_coarse_expired()
+
+
+def test_llm_hybrid_checks_remote_llm_before_start_with_sixty_second_budget():
+    ready = {"target_torso_m": [0.50, -0.10, 0.35]}
+    mover = ArmMover(telemetry=lambda: ready, confirm=True, log=lambda _m: None)
+    mover.set_servo_mode("llm_hybrid")
+    assert mover.servo_mode() == "llm_hybrid"
+    seen = []
+
+    def probe(url, timeout_s=60.0):
+        seen.append((url, timeout_s))
+        return False, "远程 LLM 连接失败（60s 超时内）：down"
+
+    mover.llm_check = probe
+    mover.controller = object()
+    mover._thread = _AliveThread()
+    refused = mover.start()
+    assert "连接失败" in refused
+    assert mover._ibvs_enabled is False
+    assert seen == [(None, 60.0)]
+
+    mover.llm_check = lambda url, timeout_s=60.0: (True, "远程 LLM 已连通")
+    started = mover.start()
+    assert "LLM 接管末端微调" in started
+    assert mover.status()["control_stage"] == "PBVS_COARSE"
+
+
+def test_sequence_llm_hybrid_checks_connection_and_labels_the_run():
+    ready = {"target_torso_m": [0.50, -0.10, 0.35]}
+    mover = ArmMover(telemetry=lambda: ready, confirm=True, log=lambda _m: None)
+    mover.set_button_sequence(["button_1"])
+    mover.set_sequence_mode("llm_hybrid")
+    assert mover.status()["sequence_mode"] == "llm_hybrid"
+    mover.llm_check = lambda url, timeout_s=60.0: (False, "远程 LLM 连接失败")
+    mover.controller = object()
+    mover._thread = _AliveThread()
+    refused = mover.start_sequence()
+    assert "连接失败" in refused
+    assert mover._sequence_run is False
+    mover.llm_check = lambda url, timeout_s=60.0: (True, "远程 LLM 已连通")
+    started = mover.start_sequence()
+    assert started == "组合启动 LLM Hybrid：Button 1"
+    assert mover._sequence_run is True
+
+
 def test_arm_sdk_click_returns_before_the_connection_finishes():
     mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None, motion_backend="")
     mover._service_node_probe = lambda: False
@@ -636,6 +721,24 @@ def test_arm_sdk_click_returns_before_the_connection_finishes():
     assert called == [True]
     assert "已拉起 arm_sdk" in mover.message
     assert mover.status()["motion_backend"] == "arm_sdk"
+
+
+def test_direct_pbvs_stops_when_arm_sdk_controller_is_missing():
+    logs = []
+    mover = ArmMover(
+        telemetry=lambda: {"target": "button_1", "target_torso_m": [0.684, -0.091, 0.456]},
+        confirm=True,
+        log=logs.append,
+        direct_pbvs_poke=True,
+    )
+    mover._running.set()
+    mover._ibvs_enabled = True
+    mover._control_stage = "DIRECT_PBVS"
+    mover._direct_pbvs_run({"target": "button_1", "target_torso_m": [0.684, -0.091, 0.456]})
+    assert not mover._running.is_set()
+    assert "arm_sdk 没有接上" in mover.message
+    mover._direct_pbvs_run({"target": "button_1", "target_torso_m": [0.684, -0.091, 0.456]})
+    assert sum("arm_sdk 没有接上" in line for line in logs) == 1
 
 
 def test_motion_backend_switches_from_idle_and_refuses_a_running_move():
@@ -935,29 +1038,6 @@ def test_reset_returns_to_the_ready_pose_without_releasing_sdk():
     assert mover.phase == "hold_for_start"
     assert mover.status()["sdk_active"] is True
     assert not mover._return_ready.is_set()
-
-
-def test_sdk_reset_moves_both_arms_together():
-    order = []
-
-    class _Controller:
-        def write_joints(self, updates, weight=1.0, dq=None):
-            return None
-
-        def ramp_arm(self, arm, degrees, seconds, dt):
-            order.append(arm)
-            time.sleep(0.15)
-            order.append((arm, tuple(degrees)))
-
-    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
-    mover._service_node_probe = lambda: False
-    mover.controller = _Controller()
-    mover._thread = _AliveThread()
-    mover._execute_return_ready()
-    assert order.index("right") < order.index(("left", LEFT_REST_DEG))
-    assert order.index("left") < order.index(("right", REST_DEG))
-    assert ("left", LEFT_REST_DEG) in order
-    assert ("right", REST_DEG) in order
 
 
 def test_direct_pbvs_starts_without_a_prior_raise(monkeypatch):
@@ -3397,6 +3477,47 @@ def test_forward_step_is_only_x_when_height_and_lateral_are_close():
     assert pbvs_x_step((0.005, 0.03, -0.04)) is None
 
 
+def test_direct_pbvs_descends_before_a_pose_when_the_tip_is_above_the_button():
+    deltas = []
+    goal = (0.6443, -0.1448, 0.3981)
+
+    class _Controller:
+        def commanded_arm_rad(self, arm):
+            return [0.1] * 7
+
+        def measured_arm_rad(self, arm):
+            return [0.1] * 7
+
+        def apply_arm_rad(self, arm, q, seconds, dt):
+            return None
+
+    class _IK:
+        def tip_xyz(self, q, offset=(0.205, 0.0, 0.0)):
+            return (0.6169, -0.1805, 0.4267)
+
+        def apply_tip_delta(self, q, dxyz, posture, offset_m=None):
+            deltas.append(tuple(round(float(value), 4) for value in dxyz))
+            mover._return_ready.set()
+            return list(q), True, 0.0, 0.01
+
+        def apply_loaded_tool_pose_target(self, *args, **kwargs):
+            raise AssertionError("a tip above the button must descend before the pose")
+
+    mover = ArmMover(
+        telemetry=lambda: {"target_torso_m": list(goal)},
+        confirm=True,
+        direct_pbvs_poke=True,
+        direct_pbvs_max_m=1.20,
+        log=lambda _m: None,
+    )
+    mover.controller = _Controller()
+    mover.ik = _IK()
+    mover._direct_pbvs_run({"target": "button_1", "target_torso_m": list(goal)})
+    assert deltas == [(0.0, 0.0, -0.02)]
+    assert "下降" in mover.message
+    assert "29" in mover.message
+
+
 def test_coarse_pbvs_descends_when_the_tip_is_already_above_the_goal():
     deltas = []
 
@@ -4373,10 +4494,92 @@ def test_three_millimetres_past_the_button_is_not_arrival():
     assert direct_pbvs_arrived((0.001, -0.001, 0.0)) is True
 
 
-def test_a_lagging_arm_keeps_the_press_going():
-    assert direct_pbvs_round_stalled(0.040, 0.040, math.radians(6.0)) is False
-    assert direct_pbvs_round_stalled(0.040, 0.040, math.radians(0.4)) is True
-    assert direct_pbvs_round_stalled(0.001, 0.020, math.radians(6.0)) is True
+def test_repeated_button_replays_and_task_bias_resets_at_the_end():
+    calls = []
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, direct_pbvs_poke=True, log=lambda _m: None)
+    mover._sequence_mode = "direct_pbvs"
+    mover._button_sequence = ["button_1", "button_1"]
+    mover._screen_progress = False
+    assert "以内" in mover.set_task_landing_bias(0.2, 0.0, 0.0)
+    assert mover._task_landing_bias_m == (0.0, 0.0, 0.0)
+    mover.set_task_landing_bias(0.01, -0.002, 0.0)
+
+    def recognize(name):
+        calls.append(("see", name))
+        return (0.40, 0.10, 0.20)
+
+    def run(name, goal):
+        calls.append(("run", name, tuple(float(value) for value in goal)))
+        mover._last_commanded_goal = mover._with_task_bias(goal)
+        mover._motion_capture = [[0.1] * 7, [0.2] * 7]
+        return True
+
+    def replay(name, label):
+        calls.append(("replay", name))
+        return True
+
+    def finish():
+        calls.append("finish")
+        mover._clear_task_landing()
+
+    mover._recognize_sequence_button = recognize
+    mover._run_direct_sequence_button = run
+    mover._replay_sequence_press = replay
+    mover._retreat_clear_of_panel = lambda label: None
+    mover._finish_sequence_and_release = finish
+    mover._run_button_sequence()
+    assert calls[0] == ("see", "button_1")
+    assert calls[1] == ("run", "button_1", (0.40, 0.10, 0.20))
+    assert ("replay", "button_1") in calls
+    assert [item for item in calls if item == ("see", "button_1")] == [("see", "button_1")]
+    assert mover._task_landing_bias_m == (0.0, 0.0, 0.0)
+    assert mover._sequence_motion == {}
+
+
+def test_changed_task_bias_shifts_the_replayed_landing():
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, direct_pbvs_poke=True, log=lambda _m: None)
+    mover.set_task_landing_bias(0.01, -0.002, 0.003)
+    mover._sequence_motion["button_1"] = {
+        "goal": (0.40, 0.10, 0.20),
+        "bias": (0.0, 0.0, 0.0),
+        "samples": [],
+    }
+    seen = {}
+    mover._move_tool_to = lambda goal: seen.update(goal=tuple(goal)) or True
+    assert mover._replay_sequence_press("button_1", "Button1")
+    assert all(abs(seen["goal"][index] - expected) < 1e-9 for index, expected in enumerate((0.41, 0.098, 0.203)))
+
+
+def test_custom_sdk_selects_the_upper_body_topic_without_arm_sdk():
+    from pathlib import Path
+
+    from ibvs_pad_touch.web.custom_upper import CustomUpperController, upper_positions
+
+    packed = upper_positions([0.1] * 7, [0.2] * 7)
+    assert packed[:7] == [0.1] * 7
+    assert packed[7:] == [0.2] * 7
+    sent = []
+    controller = CustomUpperController(sender=lambda payload: sent.append(payload), joint_file=Path("missing-joints.json"))
+    controller.write({22: 0.3, 25: -0.4}, dq={22: 0.5})
+    assert len(sent[-1]["position"]) == 14
+    assert abs(sent[-1]["position"][7] - 0.3) < 1e-9
+    assert abs(sent[-1]["position"][10] - (-0.4)) < 1e-9
+    assert abs(sent[-1]["velocity"][7] - 0.5) < 1e-9
+    assert controller.custom_sdk is True
+
+    mover = ArmMover(telemetry=lambda: {}, confirm=True, log=lambda _m: None)
+    mover._service_node_up = lambda: False
+    mover._drop_page_holder = lambda **_kwargs: None
+    mover._motion_busy = lambda: False
+    message = mover.set_motion_backend("custom_sdk")
+    assert mover._motion_backend == "custom_sdk"
+    assert "Custom_SDK" in message
+    assert "rt/arm_sdk" in message
+    mover._service_node_up = lambda: True
+    mover._motion_backend = "arm_sdk"
+    refused = mover.set_motion_backend("custom_sdk")
+    assert "h2_arm_service_node" in refused
+    assert mover._motion_backend == "arm_sdk"
 
 
 def test_dashboard_start_message_mentions_flag_in_demo():

@@ -8,13 +8,10 @@ package is installed; the position and the image comparison do not need it.
 from __future__ import annotations
 
 import re
-import threading
 from typing import Any
 
 import cv2
 import numpy as np
-
-from ibvs_pad_touch.platform import gpu_name, onnx_cuda
 
 LEXICON = (
     "返回",
@@ -42,48 +39,24 @@ LEXICON = (
 SCREEN_DIFF_THRESHOLD = 8.0
 _ENGINE: Any = None
 _ENGINE_FAILED = False
-_ENGINE_LOCK = threading.RLock()
 
 
 def _engine() -> Any:
     global _ENGINE, _ENGINE_FAILED
     if _ENGINE_FAILED:
         return None
-    if _ENGINE is not None:
-        return _ENGINE
-    with _ENGINE_LOCK:
-        if _ENGINE_FAILED:
-            return None
-        if _ENGINE is not None:
-            return _ENGINE
+    if _ENGINE is None:
         try:
             from rapidocr_onnxruntime import RapidOCR
         except Exception:
             _ENGINE_FAILED = True
             return None
-        if onnx_cuda():
-            try:
-                _ENGINE = RapidOCR(det_use_cuda=True, cls_use_cuda=True, rec_use_cuda=True)
-                print(f"[ibvs-ocr] RapidOCR CUDA {gpu_name()}", flush=True)
-                return _ENGINE
-            except Exception as exc:
-                print(f"[ibvs-ocr] CUDA 失败，改用 CPU: {exc}", flush=True)
         try:
             _ENGINE = RapidOCR()
         except Exception:
             _ENGINE_FAILED = True
             return None
-        print("[ibvs-ocr] RapidOCR CPU", flush=True)
-        return _ENGINE
-
-
-def run_ocr(image: np.ndarray) -> Any:
-    """One RapidOCR call. None means the package is not available."""
-    engine = _engine()
-    if engine is None:
-        return None
-    with _ENGINE_LOCK:
-        return engine(image)
+    return _ENGINE
 
 
 def luminance(image: np.ndarray) -> np.ndarray:
@@ -290,8 +263,7 @@ def _recognize_crop(gray: np.ndarray) -> tuple[str, float]:
     canvas = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     canvas = cv2.copyMakeBorder(canvas, 12, 12, 16, 16, cv2.BORDER_CONSTANT, value=(255, 255, 255))
     canvas = cv2.resize(canvas, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    with _ENGINE_LOCK:
-        recognized = engine.text_recognizer([canvas])[0]
+    recognized = engine.text_recognizer([canvas])[0]
     if not recognized:
         return "", 0.0
     text, score = recognized[0]

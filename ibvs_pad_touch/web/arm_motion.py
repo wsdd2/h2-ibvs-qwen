@@ -41,6 +41,9 @@ REST_DEG = (10.0, -8.0, 0.0, 15.0, 0.0, 0.0, 0.0)
 # beside the thigh; a small outward roll keeps the hands off the hips.
 # pitch, roll, yaw, elbow, wrist roll, wrist pitch, wrist yaw.
 LEFT_HANG_DEG = (0.0, 10.0, 0.0, 90.0, 0.0, 0.0, 0.0)
+# Side hang is planned for 10 s, but two arms publishing together run much longer.
+# Past this, drop arm_sdk instead of waiting for the hang to finish.
+RELEASE_LOWER_BUDGET_S = 8.0
 RIGHT_HANG_DEG = (0.0, -10.0, 0.0, 90.0, 0.0, 0.0, 0.0)
 # Left arm horizontal, camera looks across to the right hand / panel.
 # pitch/roll/yaw/elbow/w_roll/w_pitch/w_yaw.
@@ -131,6 +134,9 @@ DIRECT_EE_RPY_DEG = (-88.8133, -3.98969, 3.20691)
 DIRECT_PBVS_ARRIVE_TOL_M = 0.002
 # A fingertip already deeper than the button is not arrival, even inside 2 mm.
 DIRECT_PBVS_PAST_X_M = 0.001
+# Temporary. Direct PBVS keeps a pose whose fingertip X is past the button
+# instead of restoring the joints from before that shot.
+DIRECT_PBVS_ALLOW_PAST_X = True
 # Combination: move off and retry the same press this many times, then the next step.
 SEQUENCE_ACTION_RETRIES = 3
 # Kept so older callers still import. The live path does not use an X gap.
@@ -181,6 +187,12 @@ WRIST_IBVS_DEPTH_TOL_M = float(_IBVS_CFG.get("wrist_ibvs_depth_tol_m", 0.004))
 WRIST_IBVS_PIXEL_JUMP = float(_IBVS_CFG.get("wrist_ibvs_pixel_jump", 80.0))
 WRIST_IBVS_FILTER_ALPHA = float(_IBVS_CFG.get("wrist_ibvs_filter_alpha", 0.55))
 BUTTON_NAMES = ("button_1", "button_2", "button_3")
+LLM_CONNECT_TIMEOUT_S = 60.0
+LLM_WRIST_JPEG = Path("/tmp/ibvs_cam_d435i.jpg")
+LLM_APPROACH_DEADLINE_S = 40.0
+# Coarse chest PBVS may keep trimming YZ. After this, LLM Hybrid takes the fingertip.
+# Direct PBVS has no LLM stage, so it never starts this clock.
+LLM_PBVS_HANDOFF_S = 30.0
 DIRECT_EE_PREALIGN_STANDOFF_M = 0.15
 # Seeds and small RPY changes for one exact goal, or this search budget runs out.
 PBVS_PATH_TIMEOUT_S = 8.0
@@ -856,6 +868,8 @@ def load_yolo_models() -> None:
 # Torso +Y is left and +Z is up, so clearing the faceplate is -Y and -Z.
 SEQUENCE_CLEAR_RIGHT_M = 0.12
 SEQUENCE_CLEAR_DOWN_M = 0.10
+# Demo nudge for this combination only. The startup eye-to-hand bias stays put.
+TASK_LANDING_BIAS_MAX_M = 0.05
 
 
 def sequence_clear_goal(tip: Sequence[float]) -> tuple[float, float, float]:
@@ -1286,6 +1300,12 @@ class ArmMover:
         self.direct_pbvs_max_m = max(0.02, float(direct_pbvs_max_m))
         self.direct_pbvs_max_joint_deg = max(5.0, float(direct_pbvs_max_joint_deg))
         self.pbvs_first = bool(pbvs_first)
+        self.llm_wrist = False
+        self.llm_url = ""
+        self.llm_model = ""
+        self.llm_check = None
+        self.llm_tip_delta = None
+        self.wrist_jpeg = None
         self.camera_R_torso = camera_R_torso
         self.direct_ee_poke = bool(direct_ee_poke)
         self.direct_ee_poke_depth_m = max(0.0, min(0.02, float(direct_ee_poke_depth_m)))
@@ -1327,6 +1347,7 @@ class ArmMover:
         self._service_node_cached: tuple[float, bool] | None = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._connect_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
         self.phase = "idle"
@@ -1359,6 +1380,8 @@ class ArmMover:
         self._playback_id = ""
         self._playback_speed = 1.0
         self._pbvs_deadline: float | None = None
+        self._llm_coarse_since: float | None = None
+        self._llm_press_creeps = 0
         self._service_pbvs_sent = False
         self._pbvs_release = True
         self._pbvs_wrist_checked = False
@@ -1390,6 +1413,15 @@ class ArmMover:
         self._sequence_resume = False
         self._sequence_resume_index = 0
         self._sequence_finish_only = False
+        self._trial_press = False
+        self._trial_hold = False
+        self._trial_replay = False
+        self._trial_complete = False
+        self._task_landing_bias_m = (0.0, 0.0, 0.0)
+        self._sequence_motion: dict[str, dict[str, Any]] = {}
+        self._motion_capture: list[list[float]] | None = None
+        self._pending_press_samples: list[list[float]] = []
+        self._last_commanded_goal: tuple[float, float, float] | None = None
         self._motion_backend = self._normalize_backend(motion_backend, default="arm_sdk")
         self._left_seek_origin: list[float] | None = None
         self._left_seek_joint = 0
@@ -1471,6 +1503,13 @@ class ArmMover:
             "screen_block": None if self._screen_block is None else dict(self._screen_block),
             "sequence_run": self._sequence_run,
             "sequence_stage": self._sequence_stage,
+            "trial_press": self._trial_press,
+            "trial_hold": self._trial_hold,
+            "task_landing_bias_m": {
+                "x": round(float(self._task_landing_bias_m[0]), 4),
+                "y": round(float(self._task_landing_bias_m[1]), 4),
+                "z": round(float(self._task_landing_bias_m[2]), 4),
+            },
             "locked_buttons": {name: list(value) for name, value in self._locked_buttons.items()},
             "pbvs_source": self._pbvs_source,
             "wrist_command_step_m": (
@@ -1483,6 +1522,8 @@ class ArmMover:
     def servo_mode(self) -> str:
         if self.direct_pbvs_poke:
             return "direct_pbvs"
+        if self.pbvs_first and self.llm_wrist:
+            return "llm_hybrid"
         if self.pbvs_first:
             return "hybrid"
         if self.direct_ee_poke:
@@ -1500,16 +1541,74 @@ class ArmMover:
             self.direct_pbvs_poke = True
             self.pbvs_first = False
             self.direct_ee_poke = False
+            self.llm_wrist = False
             self.message = "模式 Direct PBVS：选按钮后 Start，一次到位后保持"
         elif chosen == "hybrid":
             self.direct_pbvs_poke = False
             self.pbvs_first = True
             self.direct_ee_poke = False
+            self.llm_wrist = False
             self.message = "模式 Hybrid VS：胸口 PBVS 粗定位，右腕图像 IBVS 完成末端进近"
+        elif chosen == "llm_hybrid":
+            self.direct_pbvs_poke = False
+            self.pbvs_first = True
+            self.direct_ee_poke = False
+            self.llm_wrist = True
+            self.message = "模式 LLM Hybrid：胸口 PBVS 粗定位，远程 LLM 完成末端微调"
         else:
             self.message = "未知伺服模式"
         self.log(f"[ARM] {self.message}")
         return self.message
+
+    def _use_llm_wrist(self) -> bool:
+        if self._sequence_run and self._sequence_mode == "llm_hybrid":
+            return True
+        return bool(self.llm_wrist)
+
+    def _llm_coarse_clock(self) -> bool:
+        """LLM Hybrid only. Direct PBVS keeps running until the fingertip arrives."""
+        if self.direct_pbvs_poke:
+            return False
+        if self._sequence_run and self._sequence_mode == "direct_pbvs":
+            return False
+        return self._use_llm_wrist()
+
+    def _note_llm_coarse(self) -> None:
+        if self._llm_coarse_clock() and self._llm_coarse_since is None:
+            self._llm_coarse_since = time.monotonic()
+
+    def _llm_coarse_expired(self) -> bool:
+        started = self._llm_coarse_since
+        if not self._llm_coarse_clock() or started is None:
+            return False
+        return time.monotonic() - started >= LLM_PBVS_HANDOFF_S
+
+    def _handoff_llm_from_pbvs(self, reason: str) -> None:
+        """Stop coarse PBVS and let the remote model move the fingertip."""
+        self._llm_coarse_since = None
+        self._llm_press_creeps = 0
+        self._pbvs_wrist_checked = True
+        self._chest_height_after_pbvs = True
+        self._wrist_close_advanced = False
+        self._control_stage = "WRIST_APPROACH"
+        self.phase = "wrist_approach"
+        self._ibvs_enabled = True
+        self._running.set()
+        self.message = f"PBVS 已超过 {LLM_PBVS_HANDOFF_S:.0f}s，交给 LLM 末端微调：{reason}"
+        self.log(f"[ARM] {self.message}")
+
+    def _start_needs_llm(self, sequence: bool) -> bool:
+        if sequence:
+            return self._sequence_mode == "llm_hybrid"
+        return bool(self.llm_wrist)
+
+    def _check_remote_llm(self, *, timeout_s: float = LLM_CONNECT_TIMEOUT_S) -> tuple[bool, str]:
+        probe = self.llm_check
+        if probe is None:
+            from ibvs_pad_touch.web.llm_fine import check_llm_connection
+
+            probe = check_llm_connection
+        return probe(self.llm_url or None, timeout_s=timeout_s)
 
     def motion_released(self) -> bool:
         """True only after 释放双臂 has dropped the controller and the motion thread."""
@@ -1548,7 +1647,7 @@ class ArmMover:
     def _sdk_holding(self) -> bool:
         """This page publishes rt/arm_sdk only through the SDK controller."""
         controller = self.controller
-        if controller is None:
+        if controller is None or getattr(controller, "custom_sdk", False):
             return False
         return not callable(getattr(controller, "move_cartesian", None))
 
@@ -1628,7 +1727,9 @@ class ArmMover:
         chosen = str(backend or "").strip().lower().replace("-", "_")
         if chosen in {"sdk", "arm"}:
             chosen = "arm_sdk"
-        if chosen in {"", "arm_sdk", "service"}:
+        if chosen in {"custom", "customsdk"}:
+            chosen = "custom_sdk"
+        if chosen in {"", "arm_sdk", "service", "custom_sdk"}:
             return chosen
         return default
 
@@ -1648,6 +1749,12 @@ class ArmMover:
         return ""
 
     def _refuse_conflict(self, publisher: str | None = None) -> str:
+        if self._motion_backend == "custom_sdk" and publisher is None:
+            if self._service_node_up():
+                self.message = "Custom_SDK 不能和运控服务同时占机器人。先停掉 h2_arm_service_node。"
+                self.log(f"[ARM][WARN] {self.message}")
+                return self.message
+            return ""
         which = publisher or ("service" if self._motion_backend == "service" else "arm_sdk")
         message = self.publisher_conflict(which)
         if message:
@@ -1695,19 +1802,23 @@ class ArmMover:
         chosen = str(backend or "").strip().lower().replace("-", "_")
         if chosen in {"sdk", "arm"}:
             chosen = "arm_sdk"
-        if chosen not in {"arm_sdk", "service"}:
-            self.message = "未知控制链路。可选 arm_sdk 或运控服务。"
+        if chosen not in {"arm_sdk", "service", "custom_sdk"}:
+            self.message = "未知控制链路。可选 arm_sdk、运控服务或 Custom_SDK。"
             self.log(f"[ARM] {self.message}")
             return self.message
         if self._motion_busy():
             if chosen == self._motion_backend:
-                self.message = (
-                    "控制链路已是 arm_sdk"
-                    if chosen == "arm_sdk"
-                    else "控制链路已是运控服务"
-                )
+                self.message = {
+                    "arm_sdk": "控制链路已是 arm_sdk",
+                    "service": "控制链路已是运控服务",
+                    "custom_sdk": "控制链路已是 Custom_SDK",
+                }[chosen]
                 return self.message
-            self.message = "请先点释放双臂，再切换 arm_sdk / 运控服务。当前仍占用控制，已拒绝。"
+            self.message = "请先点释放双臂，再切换控制链路。当前仍占用控制，已拒绝。"
+            self.log(f"[ARM][WARN] {self.message}")
+            return self.message
+        if chosen == "custom_sdk" and self._service_node_up():
+            self.message = "先停掉 h2_arm_service_node，再点 Custom_SDK。两套运控不能一起占机器人。"
             self.log(f"[ARM][WARN] {self.message}")
             return self.message
         node_up = self._service_node_up()
@@ -1743,15 +1854,36 @@ class ArmMover:
             )
             self._arm_sdk_thread.start()
             return self.message
+        if chosen == "custom_sdk":
+            self._motion_backend = "custom_sdk"
+            bridge_up = False
+            try:
+                from ibvs_pad_touch.web.custom_upper import ensure_custom_bridge
+
+                bridge_up = ensure_custom_bridge()
+            except Exception as exc:
+                self.log(f"[ARM][WARN] Custom_SDK 桥没有拉起: {exc}")
+            self.message = (
+                "控制链路：Custom_SDK。本页只发 /upper_body_joint_command，不发 rt/arm_sdk。"
+                "自定义运控需已在 udp_locomotion 或 lower_stable，且上肢外部命令已打开。"
+            )
+            if not bridge_up:
+                from ibvs_pad_touch.web.custom_upper import CUSTOM_BRIDGE_HOST, CUSTOM_BRIDGE_PORT
+
+                self.message += (
+                    " 上肢桥未接上：在本体上 source ~/.lj_ws_env 后运行 scripts/custom_sdk_bridge.py，"
+                    f"网页会连接 {CUSTOM_BRIDGE_HOST}:{CUSTOM_BRIDGE_PORT}。"
+                )
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        if not self._service_node_up():
+            self._call_start_service_node()
+            self._service_node_cached = None
+        self._motion_backend = "service"
+        if self._service_node_up():
+            self.message = "控制链路：运控服务。下次 Raise/Start 调用 h2_arm_service，本页不发 arm_sdk。"
         else:
-            if not self._service_node_up():
-                self._call_start_service_node()
-                self._service_node_cached = None
-            self._motion_backend = "service"
-            if self._service_node_up():
-                self.message = "控制链路：运控服务。下次 Raise/Start 调用 h2_arm_service，本页不发 arm_sdk。"
-            else:
-                self.message = "控制链路：运控服务。h2_arm_service_node 没有起来，Start 前请确认节点。"
+            self.message = "控制链路：运控服务。h2_arm_service_node 没有起来，Start 前请确认节点。"
         self.log(f"[ARM] {self.message}")
         return self.message
 
@@ -1779,6 +1911,8 @@ class ArmMover:
         self.phase = "returning_ready"
         if self._motion_backend == "service":
             self.message = "Reset：运控服务正在回到放下位"
+        elif self._motion_backend == "custom_sdk":
+            self.message = "Reset：Custom_SDK 正在回到放下位"
         else:
             self.message = "Reset：正在回到放下位，arm_sdk 保持"
         self.log(f"[ARM] {self.message}")
@@ -1862,7 +1996,7 @@ class ArmMover:
         return self.message
 
     def set_sequence_mode(self, mode: str) -> str:
-        """Choose Direct PBVS or Hybrid for the next combination. Does not move the arm."""
+        """Choose Direct PBVS, Hybrid, or LLM Hybrid for the next combination."""
         if self._ibvs_enabled or self._running.is_set() or self._return_ready.is_set() or self._hang_down.is_set() or self._level_right.is_set():
             self.message = "先 Pause 或等 Reset 完成，再切换组合模式"
             self.log(f"[ARM] {self.message}")
@@ -1874,6 +2008,9 @@ class ArmMover:
         elif chosen == "hybrid":
             self._sequence_mode = "hybrid"
             self.message = "动作组合：Hybrid，胸口 PBVS 后右腕进近"
+        elif chosen == "llm_hybrid":
+            self._sequence_mode = "llm_hybrid"
+            self.message = "动作组合：LLM Hybrid，胸口 PBVS 后远程 LLM 末端微调"
         else:
             self.message = "未知组合模式"
         self.log(f"[ARM] {self.message}")
@@ -1892,6 +2029,126 @@ class ArmMover:
     def start_sequence(self) -> str:
         """PBVS the queued buttons. An empty queue is refused before any motion."""
         return self.start(sequence=True)
+
+    def set_trial_press(self, enabled: bool) -> str:
+        """Trial mode stops after the first button so the XYZ bias can be edited."""
+        if self._sequence_run and self._running.is_set() and not self._trial_hold:
+            self.message = "组合进行中，先 Pause 再切换试按"
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        self._trial_press = bool(enabled)
+        if not self._trial_press:
+            self._trial_hold = False
+        self.message = "试按开：组合启动只按第一颗后停住" if self._trial_press else "试按关"
+        self.log(f"[ARM] {self.message}")
+        return self.message
+
+    def set_task_landing_bias(self, x_m: float, y_m: float, z_m: float) -> str:
+        """Shift this combination's landing. Cleared when the sequence ends."""
+        try:
+            bias = (float(x_m), float(y_m), float(z_m))
+        except (TypeError, ValueError):
+            self.message = "本轮落点需要数字，单位 m"
+            return self.message
+        if not all(math.isfinite(value) and abs(value) <= TASK_LANDING_BIAS_MAX_M for value in bias):
+            self.message = f"本轮落点每轴须在 ±{TASK_LANDING_BIAS_MAX_M * 1000:.0f} mm 以内"
+            return self.message
+        self._task_landing_bias_m = bias
+        self.message = (
+            f"本轮落点 X {bias[0] * 1000:.0f} Y {bias[1] * 1000:.0f} Z {bias[2] * 1000:.0f} mm，"
+            "组合结束清零"
+        )
+        self.log(f"[ARM] {self.message}")
+        return self.message
+
+    def _with_task_bias(self, goal: tuple[float, float, float]) -> tuple[float, float, float]:
+        bias = self._task_landing_bias_m
+        return tuple(float(goal[index]) + float(bias[index]) for index in range(3))
+
+    def _clear_task_landing(self) -> None:
+        self._task_landing_bias_m = (0.0, 0.0, 0.0)
+        self._sequence_motion.clear()
+        self._motion_capture = None
+        self._pending_press_samples = []
+        self._last_commanded_goal = None
+
+    def _remember_sequence_press(self, name: str) -> None:
+        """Keep the landing of the first successful press of this button."""
+        if name in self._sequence_motion or self._last_commanded_goal is None:
+            return
+        self._sequence_motion[name] = {
+            "goal": tuple(float(value) for value in self._last_commanded_goal),
+            "bias": tuple(float(value) for value in self._task_landing_bias_m),
+            "samples": [list(sample) for sample in (self._pending_press_samples or [])],
+        }
+
+    def _replay_sequence_press(self, name: str, label: str) -> bool:
+        """Play the stored landing again. A new task bias shifts only that point."""
+        saved = self._sequence_motion.get(name)
+        if saved is None:
+            return False
+        delta = tuple(
+            float(self._task_landing_bias_m[index]) - float(saved["bias"][index]) for index in range(3)
+        )
+        goal = tuple(float(saved["goal"][index]) + delta[index] for index in range(3))
+        self._sequence_stage = f"{label} 回放"
+        self.message = f"{label} 回放落点，不再重新识别"
+        self.log(f"[ARM] {self.message}")
+        samples = saved.get("samples") or []
+        same_bias = all(abs(float(value)) < 1e-6 for value in delta)
+        if same_bias and len(samples) >= 2:
+            self._play_cartesian_samples(samples)
+            if self._stop.is_set():
+                return False
+            self._hold_until_settled(samples[-1])
+            return not self._stop.is_set()
+        return self._move_tool_to(goal)
+
+    def finish_trial(self) -> str:
+        """Lower the right arm, then run the combination with the bias just submitted."""
+        if not self._trial_press and not self._trial_hold:
+            self.message = "试按是关的"
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        if self._running.is_set() and not self._trial_hold:
+            self.message = "等第一下停住，或先 Pause，再点试按完成"
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        if self.controller is None or self._thread is None or not self._thread.is_alive():
+            self.message = "试按完成需要手臂仍由本页控制"
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        if not self._button_sequence:
+            self.message = "动作组合为空"
+            self.log(f"[ARM] {self.message}")
+            return self.message
+        self._trial_complete = True
+        self.message = "试按完成：放下右臂后按新 bias 组合启动"
+        self.log(f"[ARM] {self.message}")
+        return self.message
+
+    def _enter_trial_hold(self, label: str, *, arrived: bool) -> None:
+        self._trial_hold = True
+        self._sequence_run = False
+        self._ibvs_enabled = False
+        self._running.clear()
+        self._control_stage = "MANUAL"
+        self.phase = "manual"
+        self._sequence_stage = "试按停住"
+        where = "已到" if arrived else "未到位，停在"
+        self.message = f"试按{where} {label}。改 XYZ bias 并提交后，点试按完成。也可 Pause 细调。"
+        self.log(f"[ARM] {self.message}")
+
+    def _execute_trial_complete(self) -> None:
+        self._trial_hold = False
+        self._lower_right_arm("试按完成，放下右臂")
+        if self._stop.is_set() or self.controller is None:
+            self._trial_replay = False
+            return
+        self._trial_replay = True
+        self.start(sequence=True)
+        if not self._sequence_run:
+            self._trial_replay = False
 
     def advance_sequence(self) -> str:
         """Skip the current combination action, or finish and release on the last one."""
@@ -1970,6 +2227,15 @@ class ArmMover:
         if not self.confirm:
             self.message = "启动网页时要加 --confirm-arm-motion"
             return self.message
+        if self._start_needs_llm(sequence):
+            self.message = f"正在检查远程 LLM 连接（超时 {LLM_CONNECT_TIMEOUT_S:.0f}s，不含推理）…"
+            self.log(f"[ARM] {self.message}")
+            ok, detail = self._check_remote_llm(timeout_s=LLM_CONNECT_TIMEOUT_S)
+            if not ok:
+                self.message = detail
+                self.log(f"[ARM] {self.message}")
+                return self.message
+            self.log(f"[ARM] {detail}")
         if (self.direct_ee_poke or self.direct_pbvs_poke or self.pbvs_first) and (
             self.controller is None or self._thread is None or not self._thread.is_alive()
         ):
@@ -1982,15 +2248,16 @@ class ArmMover:
             while self.controller is None and self._thread.is_alive() and time.monotonic() < deadline:
                 time.sleep(0.05)
         if self.controller is None or self._thread is None or not self._thread.is_alive():
-            self.message = (
-                "Direct EE 接管失败"
-                if self.direct_ee_poke
-                else (
-                    "PBVS 接管失败"
-                    if self.pbvs_first or self.direct_pbvs_poke
-                    else "请先点 Raise/Scan 举臂"
+            if self.phase != "error" or not self.message:
+                self.message = (
+                    "Direct EE 接管失败"
+                    if self.direct_ee_poke
+                    else (
+                        "PBVS 接管失败"
+                        if self.pbvs_first or self.direct_pbvs_poke
+                        else "请先点 Raise/Scan 举臂"
+                    )
                 )
-            )
             return self.message
         # Start always freezes the current scan pose first. It must never leave
         # the arm oscillating merely because one visual condition is missing.
@@ -2039,6 +2306,8 @@ class ArmMover:
         self._wrist_close_advanced = False
         self._wrist_close_advance_m = 0.0
         self._chest_height_after_pbvs = False
+        if sequence and not self._trial_replay:
+            self._sequence_motion.clear()
         self._sequence_run = bool(sequence)
         self._reset_left_seek()
         self._running.set()
@@ -2046,7 +2315,12 @@ class ArmMover:
             labels = {"button_1": "Button 1", "button_2": "Button 2", "button_3": "Button 3"}
             names = " → ".join(labels.get(name, name) for name in self._button_sequence)
             self._control_stage = "DIRECT_PBVS"
-            kind = "Direct PBVS" if self._sequence_mode == "direct_pbvs" else "Hybrid"
+            if self._sequence_mode == "direct_pbvs":
+                kind = "Direct PBVS"
+            elif self._sequence_mode == "llm_hybrid":
+                kind = "LLM Hybrid"
+            else:
+                kind = "Hybrid"
             self.message = f"组合启动 {kind}：{names}"
             self._emit_task_begin()
             return self.message
@@ -2056,6 +2330,9 @@ class ArmMover:
         elif self.direct_pbvs_poke:
             self._control_stage = "DIRECT_PBVS"
             self.message = "Start：Direct PBVS 交给 /h2_arm/singlearmcartesian"
+        elif self.pbvs_first and self.llm_wrist:
+            self._control_stage = "PBVS_COARSE"
+            self.message = "Start：胸口 PBVS 粗定位，远程 LLM 接管末端微调"
         elif self.pbvs_first:
             self._control_stage = "PBVS_COARSE"
             self.message = "Start：胸口 PBVS 粗定位，右腕图像 IBVS 接管末端进近"
@@ -2317,8 +2594,45 @@ class ArmMover:
             result["elbow_deg"] = result["joint_deg"]
         return result
 
+    def _lower_arms_beside_body(self, timeout_s: float) -> bool:
+        """Start the side hang. Return once both arms finish, or when the budget ends."""
+        controller = self.controller
+        if controller is None:
+            return True
+        quintic = getattr(controller, "play_quintic_arm_rad", None)
+        poses = (("left", LEFT_HANG_DEG), ("right", RIGHT_HANG_DEG))
+        errors: list[BaseException] = []
+
+        def run(arm: str, degrees: Sequence[float]) -> None:
+            try:
+                target = [math.radians(float(value)) for value in degrees]
+                if callable(quintic):
+                    quintic(arm, target, 10.0, 0.02)
+                else:
+                    controller.ramp_arm(arm, degrees, seconds=10.0, dt=0.02)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=run, args=pose, name=f"lower-{pose[0]}", daemon=True)
+            for pose in poses
+        ]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        alive = any(thread.is_alive() for thread in threads)
+        if errors and not alive:
+            raise errors[0]
+        return not alive
+
     def release_for_operator(self) -> str:
-        """Drop the current arm_sdk holder. Do not blend weight or start another publisher."""
+        """Lower both arms beside the body, then drop arm_sdk."""
+        self._clear_task_landing()
         self._record_action_pose("已释放")
         self._stop_playback()
         if self.controller is None and (self._thread is None or not self._thread.is_alive()):
@@ -2340,35 +2654,48 @@ class ArmMover:
         self._height_locked = False
         self._seek_done = False
         self._stop.set()
-        controller = self.controller
-        if controller is not None:
-            abort = getattr(controller, "abort", None)
-            try:
-                if callable(abort):
-                    self.log("[ARM] 释放：只关闭当前 arm_sdk，不拉起运控服务")
-                    abort()
-                else:
-                    self.log("[ARM] 释放：当前控制器没有 abort，改发 weight=0")
-                    controller.release(seconds=0.0)
-            except Exception as exc:
-                self.log(f"[ARM] 松权失败: {exc}")
-                try:
-                    controller.release(seconds=0.0)
-                except Exception as release_exc:
-                    self.log(f"[ARM] release: {release_exc}")
-        self.controller = None
         thread = self._thread
         self._thread = None
+        deadline = time.monotonic() + RELEASE_LOWER_BUDGET_S
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        controller = self.controller
+        self.message = "释放：先把双臂缓放到身体两侧"
+        self.log(f"[ARM] {self.message}")
+        lowered = False
+        if controller is not None and time.monotonic() < deadline:
+            try:
+                lowered = self._lower_arms_beside_body(deadline - time.monotonic())
+            except Exception as exc:
+                self.log(f"[ARM] 缓放失败，改为直接释放: {exc}")
+                lowered = False
+        if controller is not None:
+            try:
+                if lowered:
+                    controller.release(seconds=1.2)
+                else:
+                    self.log(f"[ARM] 缓放超过 {RELEASE_LOWER_BUDGET_S:.0f}s，直接释放")
+                    abort = getattr(controller, "abort", None)
+                    if callable(abort):
+                        abort()
+                    else:
+                        controller.release(seconds=0.0)
+            except Exception as exc:
+                self.log(f"[ARM] 松权失败: {exc}")
+        self.controller = None
         self.phase = "released"
-        self.message = "已释放双臂。arm_sdk 已关闭，没有拉起新的控制。"
+        self.message = (
+            "双臂已缓放到身体两侧，并释放 arm_sdk。"
+            if lowered
+            else f"缓放超过 {RELEASE_LOWER_BUDGET_S:.0f}s，已直接释放 arm_sdk。"
+        )
         self.log(f"[ARM] {self.message}")
         self._emit_task_end("stopped")
         return self.message
 
     def emergency_stop(self) -> str:
         """Drop both arms now and release SDK and the service node. No pose plan."""
+        self._clear_task_landing()
         self._record_action_pose("已释放")
         self._stop_playback()
         self._ibvs_enabled = False
@@ -2515,61 +2842,92 @@ class ArmMover:
         conflict = self._refuse_conflict()
         if conflict:
             raise RuntimeError(conflict)
-        if self.controller is not None:
-            return
-        ensure_handeye_calib()
-        from handeye_calib.h2_ee_ik import H2CameraIK
+        with self._connect_lock:
+            if self.controller is not None:
+                return
+            ensure_handeye_calib()
+            from handeye_calib.h2_ee_ik import H2CameraIK
 
-        if self._motion_backend == "service":
-            from ibvs_pad_touch.web.arm_service import H2ArmServiceController
+            if self._motion_backend == "service":
+                from ibvs_pad_touch.web.arm_service import H2ArmServiceController
 
-            self.controller = H2ArmServiceController()
-            self.ik = H2CameraIK(arm="right")
-            self.log("[ARM] 运控服务已接，本进程不发 arm_sdk")
-            self._publish_ee()
-            return
-        from ibvs_pad_touch.web.dds_bind import ensure_unitree_sdk2py
+                self.controller = H2ArmServiceController()
+                self.ik = H2CameraIK(arm="right")
+                self.log("[ARM] 运控服务已接，本进程不发 arm_sdk")
+                self._publish_ee()
+                return
+            if self._motion_backend == "custom_sdk":
+                from ibvs_pad_touch.web.custom_upper import CustomUpperController, ensure_custom_bridge
 
-        ensure_unitree_sdk2py()
-        from handeye_calib.h2_arm_sdk import H2ArmSdkController
+                if not ensure_custom_bridge():
+                    from ibvs_pad_touch.web.custom_upper import CUSTOM_BRIDGE_HOST, CUSTOM_BRIDGE_PORT
 
-        try:
-            self.controller = H2ArmSdkController(
-                iface=self.iface,
-                kp=85.0,
-                kd=2.2,
-                gravity=True,
-                tau_scale=1.0,
-                wrist_payload_kg=0.75,
-            )
-        except TypeError:
-            self.controller = H2ArmSdkController(iface=self.iface)
-            self.controller.kp = 85.0
-            self.controller.kd = 2.2
-        self.controller.hold_waist_yaw = True
-        self.controller.wait_lowstate()
-        self._ensure_gravity()
-        self.controller.ensure_ai_mode(select_ai=True)
-        self.controller.enable_arm_sdk()
-        self.ik = H2CameraIK(arm="right")
-        self.log("[ARM] arm_sdk 已接，重力补偿开，腰 yaw 补偿开")
-        self._publish_ee()
+                    raise RuntimeError(
+                        "Custom_SDK 桥未接上。"
+                        f"在本体上 source ~/.lj_ws_env 后运行 scripts/custom_sdk_bridge.py，"
+                        f"T40 要能连上 {CUSTOM_BRIDGE_HOST}:{CUSTOM_BRIDGE_PORT}"
+                    )
+                self.controller = CustomUpperController()
+                self.ik = H2CameraIK(arm="right")
+                self.log("[ARM] Custom_SDK 已接，本进程不发 rt/arm_sdk")
+                self._publish_ee()
+                return
+            from ibvs_pad_touch.web.dds_bind import ensure_unitree_sdk2py
 
-    def _ensure_gravity(self) -> None:
+            ensure_unitree_sdk2py()
+            from handeye_calib.h2_arm_sdk import H2ArmSdkController
+
+            pending = None
+            try:
+                try:
+                    pending = H2ArmSdkController(
+                        iface=self.iface,
+                        kp=85.0,
+                        kd=2.2,
+                        gravity=True,
+                        tau_scale=1.0,
+                        wrist_payload_kg=0.75,
+                    )
+                except TypeError:
+                    pending = H2ArmSdkController(iface=self.iface)
+                    pending.kp = 85.0
+                    pending.kd = 2.2
+                pending.hold_waist_yaw = True
+                pending.wait_lowstate()
+                self._ensure_gravity(pending)
+                pending.ensure_ai_mode(select_ai=True)
+                pending.enable_arm_sdk()
+                self.ik = H2CameraIK(arm="right")
+                self.controller = pending
+                pending = None
+                self.log("[ARM] arm_sdk 已接，重力补偿开，腰 yaw 补偿开")
+                self._publish_ee()
+            except Exception:
+                if pending is not None:
+                    abort = getattr(pending, "abort", None)
+                    if callable(abort):
+                        try:
+                            abort()
+                        except Exception as exc:
+                            self.log(f"[ARM] 抬臂失败后释放 arm_sdk 失败: {exc}")
+                raise
+
+    def _ensure_gravity(self, controller: Any = None) -> None:
         from handeye_calib.h2_gravity import H2GravityCompensator, format_tau_summary
 
-        if getattr(self.controller, "_gravity", None) is None:
+        controller = self.controller if controller is None else controller
+        if getattr(controller, "_gravity", None) is None:
             self.log("[ARM][WARN] 控制器没挂上重力补偿，现场补挂")
-            self.controller._gravity = H2GravityCompensator(
+            controller._gravity = H2GravityCompensator(
                 wrist_payload_kg=0.75,
                 payload_arm="right",
                 tau_scale=1.0,
             )
-            self.controller._format_tau = format_tau_summary
-        self._add_left_camera_payload()
+            controller._format_tau = format_tau_summary
+        self._add_left_camera_payload(controller)
         q = {22 + i: math.radians(READY_DEG[i]) for i in range(7)}
         q.update({15 + i: math.radians(LEFT_SIDE_VIEW_DEG[i]) for i in range(7)})
-        tau = self.controller._gravity.motor_tau(q)
+        tau = controller._gravity.motor_tau(q)
         shoulder = float(tau.get(22, 0.0))
         elbow = float(tau.get(25, 0.0))
         left_shoulder = float(tau.get(16, 0.0))
@@ -2583,8 +2941,9 @@ class ArmMover:
                 "请同步 Hand_Eye_Calib 和 /home/unitree/MscapeTech/urdf/H2.urdf"
             )
 
-    def _add_left_camera_payload(self) -> None:
-        gravity = getattr(self.controller, "_gravity", None)
+    def _add_left_camera_payload(self, controller: Any = None) -> None:
+        controller = self.controller if controller is None else controller
+        gravity = getattr(controller, "_gravity", None)
         if gravity is None or not hasattr(gravity, "_add_payload"):
             return
         gravity._add_payload(
@@ -2634,17 +2993,47 @@ class ArmMover:
                     self.log(f"[ARM][ERROR] {exc}")
                     self._return_ready.clear()
                 continue
+            if self._trial_complete:
+                self._trial_complete = False
+                try:
+                    self._execute_trial_complete()
+                except Exception as exc:
+                    self._trial_replay = False
+                    self.phase = "error"
+                    self.message = f"试按完成失败: {exc}"
+                    self.log(f"[ARM][ERROR] {exc}")
+                continue
             if not self._running.is_set():
                 self._publish_ee()
+                time.sleep(0.05)
+                continue
+            if self.controller is None:
+                self._stop_servo_without_controller()
                 time.sleep(0.05)
                 continue
             try:
                 self._publish_ee()
                 self._servo_once()
             except Exception as exc:
-                self.message = f"伺服: {exc}"
-                self.log(f"[ARM][WARN] {exc}")
+                if self.controller is None:
+                    self._stop_servo_without_controller()
+                else:
+                    self.message = f"伺服: {exc}"
+                    self.log(f"[ARM][WARN] {exc}")
             time.sleep(0.08)
+
+    def _stop_servo_without_controller(self) -> None:
+        """A Start tick must not keep reading joints after arm_sdk has been dropped."""
+        already = not self._running.is_set() and not self._ibvs_enabled
+        self._ibvs_enabled = False
+        self._running.clear()
+        self._scanning.clear()
+        if already and "arm_sdk 没有接上" in str(self.message):
+            return
+        self._control_stage = "HOLD"
+        self.phase = "hold_for_start"
+        self.message = "伺服已停：arm_sdk 没有接上。看到「已拉起 arm_sdk」后再点 Start。"
+        self.log(f"[ARM][WARN] {self.message}")
 
     def _swing_right_arm_clear(self) -> None:
         """Abduct a low, torso-hugging right arm before any raise.
@@ -3053,7 +3442,10 @@ class ArmMover:
             self._pbvs_once(telem)
             return
         if self._control_stage == "WRIST_APPROACH":
-            self._wrist_approach_once(telem)
+            if self._use_llm_wrist():
+                self._llm_approach_once(telem)
+            else:
+                self._wrist_approach_once(telem)
             return
         if self._control_stage == "DUAL_IBVS":
             self._dual_once(telem)
@@ -3783,12 +4175,18 @@ class ArmMover:
         self._wrist_close_advanced = False
         self._wrist_close_advance_m = 0.0
         self._chest_height_after_pbvs = True
+        self._llm_coarse_since = None
+        self._llm_press_creeps = 0
         self._control_stage = "WRIST_APPROACH"
         self.phase = "wrist_approach"
         if self._sequence_run and self._goal_name:
             self._sequence_stage = f"{SEQUENCE_BUTTON_LABELS.get(self._goal_name, self._goal_name)} 进近"
-        self.message = "胸口 PBVS 已核对，右腕图像 IBVS 接管末端进近"
-        self.log("[ARM] chest PBVS ready -> wrist IBVS")
+        if self._use_llm_wrist():
+            self.message = "胸口 PBVS 已核对，LLM 接管末端微调"
+            self.log("[ARM] chest PBVS ready -> LLM")
+        else:
+            self.message = "胸口 PBVS 已核对，右腕图像 IBVS 接管末端进近"
+            self.log("[ARM] chest PBVS ready -> wrist IBVS")
 
     def _wrist_R_torso_from_cam(self):
         """Rotation that maps a wrist-camera displacement into the torso frame.
@@ -4055,6 +4453,260 @@ class ArmMover:
                 + " ".join(f"{name} {err[index] * 1000:+.0f}mm" for index, name in enumerate("XYZ"))
             )
         return True
+
+    def _llm_xyz(self, raw: Any) -> list[float] | None:
+        if not raw or len(raw) != 3:
+            return None
+        try:
+            point = [float(value) for value in raw]
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in point):
+            return None
+        return point
+
+    def _llm_vision(
+        self,
+        telem: dict[str, Any],
+        goal_name: str,
+        tip: tuple[float, float, float] | None,
+        view: dict[str, Any],
+    ) -> dict[str, Any]:
+        """PBVS landing, live chest detection, and the signed fingertip error."""
+        pbvs = self._llm_xyz(self._locked_buttons.get(goal_name))
+        if pbvs is None:
+            pbvs = self._llm_xyz(self._last_commanded_goal)
+        chest = self._llm_xyz(telem.get("chest_pose_button_torso_m")) or self._llm_xyz(
+            telem.get("target_torso_m")
+        )
+        goal = chest or pbvs
+        current = self._llm_xyz(tip) or self._llm_xyz(telem.get("tip_torso_m"))
+        error = None
+        if goal is not None and current is not None:
+            error = [goal[index] - current[index] for index in range(3)]
+        built = {
+            "pbvs_xyz_m": pbvs,
+            "chest_xyz_m": chest,
+            "tip_xyz_m": current,
+            "error_m": error,
+            "chest_button_uv": telem.get("chest_pose_button_uv") or telem.get("target_uv"),
+            "chest_tip_uv": telem.get("tip_uv"),
+            "wrist_button_uv": view.get("target_uv") or telem.get("wrist_target_uv"),
+            "wrist_tip_uv": view.get("tip_uv") or telem.get("wrist_tip_uv"),
+            "wrist_message": telem.get("wrist_message") or "",
+        }
+        from ibvs_pad_touch.web.llm_fine import pixel_gap_px
+
+        wrist_gap = pixel_gap_px(built["wrist_button_uv"], built["wrist_tip_uv"])
+        chest_gap = pixel_gap_px(built["chest_button_uv"], built["chest_tip_uv"])
+        built["pixel_gap_px"] = wrist_gap if wrist_gap is not None else chest_gap
+        built["finger_on_button"] = False
+        built["finger_low"] = bool(view.get("red_bar")) and built["pixel_gap_px"] is None
+        return built
+
+    def _read_wrist_scene(self, jpeg: bytes, goal_name: str, vision: dict[str, Any]) -> None:
+        """Fill Finger/Button alignment from the wrist frame's yellow and red bars."""
+        try:
+            import cv2
+            import numpy as np
+
+            from ibvs_pad_touch.perception.yellow_buttons import detect_red_bar, detect_yellow_bars
+            from ibvs_pad_touch.web.llm_fine import panel_scene
+        except Exception as exc:
+            self.log(f"[ARM] 画面规则未加载: {exc}")
+            return
+        bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        bars: list[dict[str, float]] = []
+        red = bool(vision.get("finger_low"))
+        if bgr is not None:
+            red = bool(detect_red_bar(bgr))
+            for bar in detect_yellow_bars(bgr):
+                bars.append(
+                    {
+                        "cx": float(bar.cx),
+                        "cy": float(bar.cy),
+                        "left": float(bar.left),
+                        "right": float(bar.right),
+                        "width": float(bar.width),
+                    }
+                )
+        scene = panel_scene(
+            target=str(goal_name),
+            finger_uv=vision.get("wrist_tip_uv"),
+            button_uv=vision.get("wrist_button_uv"),
+            yellow_bars=bars,
+            red_bar=red,
+        )
+        vision.update(scene)
+        if scene.get("aim_uv") and not vision.get("wrist_button_uv"):
+            vision["wrist_button_uv"] = scene["aim_uv"]
+
+    def _llm_follow_visible_gap(self, view: dict[str, Any], vision: dict[str, Any]) -> bool:
+        """Move the fingertip toward the button that is still visibly offset."""
+        button_uv = vision.get("wrist_button_uv")
+        tip_uv = vision.get("wrist_tip_uv")
+        if (
+            isinstance(button_uv, (list, tuple))
+            and isinstance(tip_uv, (list, tuple))
+            and len(button_uv) >= 2
+            and len(tip_uv) >= 2
+        ):
+            intrinsics = view.get("intrinsics") or {}
+            try:
+                command = eye_in_hand_close_align_step(
+                    (float(button_uv[0]), float(button_uv[1])),
+                    (float(tip_uv[0]), float(tip_uv[1])),
+                    fx=float(intrinsics.get("fx") or 615.0),
+                    fy=float(intrinsics.get("fy") or 615.0),
+                    cx=float(intrinsics.get("cx") or 320.0),
+                    cy=float(intrinsics.get("cy") or 240.0),
+                    nominal_z_m=WRIST_CLOSE_NOMINAL_Z_M,
+                    lambda_xy=WRIST_IBVS_LAMBDA_XY,
+                    dt_s=WRIST_IBVS_DT_S,
+                    max_step_m=0.012,
+                )
+            except (TypeError, ValueError) as exc:
+                self.message = f"画面偏差还在，腕部对齐无效：{exc}"
+                return False
+            camera_step = tuple(float(value) for value in command["camera_step_m"])
+            ok = self._apply_wrist_camera_step(camera_step, limit_m=0.012, seconds=0.35)
+            if ok and not str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                self.message = f"画面还差 {float(command['pixel_err']):.0f}px，继续把指尖移向按键"
+                self.log(f"[ARM] {self.message}")
+            return ok
+        return False
+
+    def _wrist_jpeg_bytes(self) -> bytes:
+        grab = self.wrist_jpeg
+        if callable(grab):
+            try:
+                blob = grab()
+            except Exception as exc:
+                self.log(f"[ARM] 读取右腕 JPEG 失败: {exc}")
+                return b""
+            return bytes(blob or b"")
+        path = LLM_WRIST_JPEG
+        try:
+            if path.is_file():
+                data = path.read_bytes()
+                if data.startswith(b"\xff\xd8"):
+                    return data
+        except OSError as exc:
+            self.log(f"[ARM] 读取 {path} 失败: {exc}")
+        return b""
+
+    def _llm_approach_once(self, telem: dict[str, Any]) -> None:
+        """After chest PBVS, ask the remote LLM for one torso-frame fingertip nudge."""
+        view = self.wrist_view() if callable(self.wrist_view) else {}
+        goal_name = self._wrist_goal_name(telem) or self._goal_name or "button_1"
+        tip = self._measured_tip()
+        if tip is None and self._right_ee_xyz_m and len(self._right_ee_xyz_m) == 3:
+            tip = tuple(float(value) for value in self._right_ee_xyz_m)
+        vision = self._llm_vision(telem, goal_name, tip, view)
+        error = vision.get("error_m")
+        from ibvs_pad_touch.web.llm_fine import image_still_off
+
+        image_open = image_still_off(vision)
+        x_open = (
+            isinstance(error, (list, tuple))
+            and len(error) == 3
+            and math.isfinite(float(error[0]))
+            and float(error[0]) > 0.008
+        )
+        jpeg = self._wrist_jpeg_bytes()
+        if jpeg:
+            self._read_wrist_scene(jpeg, goal_name, vision)
+            image_open = image_still_off(vision)
+        if (bool(telem.get("wrist_contact")) or bool(view.get("contact"))) and vision.get("finger_on_button") and not x_open and not image_open:
+            if callable(self.wrist_watch):
+                self.wrist_watch(False)
+            self._ibvs_enabled = False
+            self._control_stage = "HOLD"
+            self._running.clear()
+            self.phase = "contact"
+            self.message = "Finger 已对上按键，LLM 末端微调停止"
+            self.log("[ARM] LLM finger on button, stop")
+            return
+        if not jpeg:
+            self.phase = "wrist_wait_target"
+            self.message = "LLM 微调等待右腕画面"
+            return
+        ask = self.llm_tip_delta
+        if ask is None:
+            from ibvs_pad_touch.web.llm_fine import LlmUnavailable, request_tip_delta
+
+            ask = request_tip_delta
+        else:
+            from ibvs_pad_touch.web.llm_fine import LlmUnavailable
+
+        depth_ok = bool(telem.get("depth_available")) and not bool(view.get("close_range"))
+        try:
+            command = ask(
+                jpeg,
+                tip_xyz=tip,
+                button=str(goal_name),
+                depth_ok=depth_ok,
+                vision=vision,
+                url=self.llm_url or None,
+                model=self.llm_model or None,
+            )
+        except LlmUnavailable as error:
+            self.phase = "wrist_pbvs_unavailable"
+            self.message = str(error)
+            self.log(f"[ARM] {self.message}")
+            return
+        except Exception as error:
+            self.phase = "wrist_pbvs_unavailable"
+            self.message = f"LLM 微调失败：{error}"
+            self.log(f"[ARM] {self.message}")
+            return
+        delta = [float(value) for value in command.get("delta_xyz") or (0.0, 0.0, 0.0)]
+        reason = str(command.get("reason") or "")
+        from ibvs_pad_touch.web.llm_fine import focus_press
+
+        allow_creep = self._llm_press_creeps < 4
+        delta, pressed_done = focus_press(
+            delta,
+            error if isinstance(error, (list, tuple)) else None,
+            bool(command.get("done")),
+            allow_creep=allow_creep,
+            image_open=image_open,
+            finger_on_button=bool(vision.get("finger_on_button")),
+            finger_low=bool(vision.get("finger_low")),
+        )
+        if image_open and math.hypot(delta[1], delta[2]) < 0.002:
+            if self._llm_follow_visible_gap(view, vision):
+                return
+        if (
+            allow_creep
+            and isinstance(error, (list, tuple))
+            and len(error) == 3
+            and math.isfinite(float(error[0]))
+            and -0.004 < float(error[0]) <= 0.002
+            and delta[0] >= 0.007
+        ):
+            self._llm_press_creeps += 1
+        if pressed_done and max(abs(value) for value in delta) < 1e-4 and not x_open and not image_open:
+            self.phase = "wrist_wait_target"
+            self.message = "X 已进入 8 mm，等待接触确认" + (f"：{reason}" if reason else "")
+            return
+        if max(abs(value) for value in delta) < 1e-5:
+            if image_open and self._llm_follow_visible_gap(view, vision):
+                return
+            self.phase = "wrist_wait_target"
+            self.message = "LLM 本步位移为 0，继续观察"
+            return
+        ok = self._apply_torso_delta(
+            tuple(delta),
+            seconds=0.35,
+            phase="WRIST_APPROACH",
+            limit_m=None,
+        )
+        if not ok:
+            return
+        shown = " ".join(f"{axis} {delta[index] * 1000:+.1f}mm" for index, axis in enumerate("XYZ"))
+        self.message = f"LLM 微调 {shown}" + (f"：{reason}" if reason else "")
+        self.log(f"[ARM] {self.message}")
 
     def _wrist_approach_once(self, telem: dict[str, Any]) -> None:
         """Servo the wrist-camera button onto the gripper tip, then wait for contact.
@@ -4504,6 +5156,10 @@ class ArmMover:
         return True
 
     def _pbvs_once(self, telem: dict[str, Any]) -> None:
+        self._note_llm_coarse()
+        if self._llm_coarse_expired():
+            self._handoff_llm_from_pbvs("粗定位未在时限内到位")
+            return
         self._swing_right_arm_clear()
         target = self._goal_from_telem(telem)
         if target is None:
@@ -5378,8 +6034,23 @@ class ArmMover:
                 outcome = "已释放" if self._stop.is_set() else ("到位" if arrived else "未到位")
                 self._record_action_pose(outcome)
 
+    def _sequence_press_goal(self, telem: dict[str, Any], target: tuple[float, float, float]) -> tuple[float, float, float]:
+        """Use the locked landing on a replay. The first press may still read the chest, then add this task's nudge."""
+        if telem.get("lock_goal"):
+            goal = tuple(float(value) for value in target)
+        else:
+            seen = self._pose_target_xyz() or target
+            goal = tuple(float(value) for value in seen)
+            if self._sequence_run:
+                goal = self._with_task_bias(goal)
+        self._last_commanded_goal = goal
+        return goal
+
     def _run_hybrid_button_run(self, name: str, goal: tuple[float, float, float]) -> bool:
         """Same path as one Hybrid Start: chest PBVS until the fingertip arrives, then wrist IBVS."""
+        if self._sequence_run:
+            goal = self._with_task_bias(goal)
+        self._last_commanded_goal = tuple(float(value) for value in goal)
         self._goal_name = name
         self._locked_buttons = {name: goal}
         self._pbvs_release = False
@@ -5475,10 +6146,11 @@ class ArmMover:
             self.log(f"[ARM] {self.message}")
             return False
         self._chest_height_after_pbvs = True
+        use_llm = self._use_llm_wrist()
         if self._sequence_run:
-            self._sequence_stage = f"{label} 进近"
-            self.message = f"{label} 进近"
-        deadline = time.monotonic() + 40.0
+            self._sequence_stage = f"{label} {'LLM微调' if use_llm else '进近'}"
+            self.message = f"{label} {'LLM微调' if use_llm else '进近'}"
+        deadline = time.monotonic() + LLM_APPROACH_DEADLINE_S
         while time.monotonic() < deadline:
             self._raise_if_sequence_next()
             if self._return_ready.is_set() or self._stop.is_set():
@@ -5486,8 +6158,11 @@ class ArmMover:
             if self.phase == "contact" or self._wrist_contact():
                 return True
             fresh = self.telemetry() or {}
-            self._wrist_approach_once(fresh)
-            if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+            if use_llm:
+                self._llm_approach_once(fresh)
+            else:
+                self._wrist_approach_once(fresh)
+            if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败", "LLM 微调失败", "LLM 推理")):
                 return False
             if self.phase == "contact":
                 return True
@@ -5495,7 +6170,11 @@ class ArmMover:
                 return False
             time.sleep(0.05)
         self.phase = "direct_pbvs_short"
-        self.message = f"{name} 右腕进近未碰到按键"
+        self.message = (
+            f"{name} LLM 末端微调未碰到按键"
+            if use_llm
+            else f"{name} 右腕进近未碰到按键"
+        )
         self.log(f"[ARM] {self.message}")
         return False
 
@@ -5578,6 +6257,7 @@ class ArmMover:
         self._stop.set()
 
     def _finish_sequence_and_release(self) -> None:
+        self._clear_task_landing()
         self._sequence_stage = "结束放下"
         try:
             self._lower_right_arm("结束放下")
@@ -5918,45 +6598,65 @@ class ArmMover:
                 label = SEQUENCE_BUTTON_LABELS.get(name, name)
                 attempt = 0
                 goal_fixed = None
-                anchor = None
+                already_clear = False
                 self._mark_retry(0)
                 try:
                     while True:
                         if self._return_ready.is_set() or self._stop.is_set():
                             return
                         self._mark_retry(attempt)
-                        if index > 0 and not cleared:
-                            previous = SEQUENCE_BUTTON_LABELS.get(steps[index - 1], steps[index - 1])
-                            self._retreat_clear_of_panel(previous)
+                        if not already_clear and (attempt or (index > 0 and not cleared)):
+                            clear_label = (
+                                label
+                                if attempt
+                                else SEQUENCE_BUTTON_LABELS.get(steps[index - 1], steps[index - 1])
+                            )
+                            self._retreat_clear_of_panel(clear_label)
                             if self._return_ready.is_set() or self._stop.is_set():
                                 return
-                            cleared = True
-                            anchor = None
-                        if anchor is None:
-                            anchor = self._snapshot_right_joints()
-                        elif attempt:
-                            self._restore_right_joints(anchor)
+                        already_clear = False
                         cleared = True
-                        self._sequence_stage = f"{label} PBVS"
-                        if goal_fixed is None:
-                            goal_fixed = self._recognize_sequence_button(name)
-                        goal = goal_fixed
                         kind = "Direct PBVS" if direct else "Hybrid"
-                        self.message = f"动作 {index + 1}/{len(steps)} {name} {kind}"
-                        if attempt:
-                            self.message = f"{self._retry_text(attempt)} {label} {kind}"
-                        self.log(f"[ARM] {self.message}")
-                        if goal is None:
-                            self.phase = "direct_pbvs_rejected"
-                            self.message = f"重新识别 {name} 失败，胸口没有看到该按键"
-                            self.log(f"[ARM] {self.message}")
-                            ran = False
+                        self._sequence_stage = f"{label} PBVS"
+                        replay = name in self._sequence_motion
+                        if replay:
+                            self._motion_capture = None
+                            ran = self._replay_sequence_press(name, label)
+                            goal = None
                         else:
-                            ran = (
-                                self._run_direct_sequence_button(name, goal)
-                                if direct
-                                else self._run_hybrid_button(name, goal)
-                            )
+                            if goal_fixed is None:
+                                goal_fixed = self._recognize_sequence_button(name)
+                            goal = goal_fixed
+                            self.message = f"动作 {index + 1}/{len(steps)} {name} {kind}"
+                            if attempt:
+                                self.message = f"{self._retry_text(attempt)} {label} {kind}"
+                            self.log(f"[ARM] {self.message}")
+                            if goal is None:
+                                self.phase = "direct_pbvs_rejected"
+                                self.message = f"重新识别 {name} 失败，胸口没有看到该按键"
+                                self.log(f"[ARM] {self.message}")
+                                ran = False
+                            else:
+                                self._motion_capture = []
+                                ran = (
+                                    self._run_direct_sequence_button(name, goal)
+                                    if direct
+                                    else self._run_hybrid_button(name, goal)
+                                )
+                                self._pending_press_samples = [
+                                    list(sample) for sample in self._motion_capture
+                                ]
+                                self._motion_capture = None
+                        if (
+                            self._trial_press
+                            and not self._trial_replay
+                            and index == 0
+                            and attempt == 0
+                        ):
+                            if ran and not replay:
+                                self._remember_sequence_press(name)
+                            self._enter_trial_hold(label, arrived=bool(ran))
+                            return
                         if not ran:
                             if self._return_ready.is_set() or self._stop.is_set():
                                 return
@@ -5966,7 +6666,6 @@ class ArmMover:
                                 )
                                 self.log(f"[ARM] {self.message}")
                                 self._mark_retry(0)
-                                self._restore_right_joints(anchor)
                                 break
                             self._mark_retry(attempt + 1)
                             self.message = f"{self._retry_text(attempt + 1)} {label} {kind}"
@@ -5979,6 +6678,8 @@ class ArmMover:
                             return
                         if not self._screen_progress:
                             self._mark_retry(0)
+                            if not replay:
+                                self._remember_sequence_press(name)
                             self.message = (
                                 f"Direct PBVS 完成，{name} 完成"
                                 if direct
@@ -5986,7 +6687,7 @@ class ArmMover:
                             )
                             self.log(f"[ARM] {self.message}")
                             break
-                        self._restore_right_joints(anchor)
+                        self._retreat_clear_of_panel(label)
                         if self._return_ready.is_set() or self._stop.is_set():
                             return
                         changed = self._read_progress_screen(label)
@@ -5994,6 +6695,8 @@ class ArmMover:
                             return
                         if changed is True:
                             self._mark_retry(0)
+                            if not replay:
+                                self._remember_sequence_press(name)
                             break
                         if self._screen_attempt_failed(label, changed, attempt):
                             self.message = f"{label} {self._retry_text(attempt)}后仍失败，进行下一步"
@@ -6002,6 +6705,7 @@ class ArmMover:
                             break
                         self._mark_retry(attempt + 1)
                         attempt += 1
+                        already_clear = True
                 except SequenceNext:
                     if index + 1 >= len(steps):
                         break
@@ -6011,6 +6715,7 @@ class ArmMover:
             self._finish_sequence_and_release()
         finally:
             self._mark_retry(0)
+            self._trial_replay = False
             with self._sequence_lock:
                 self._sequence_inside = False
                 self._sequence_skip = 0
@@ -6195,6 +6900,9 @@ class ArmMover:
 
     def _direct_pbvs_run(self, telem: dict[str, Any], *, release: bool = True) -> None:
         """Move the measured fingertip onto the button, then correct gravity sag."""
+        if self.controller is None:
+            self._stop_servo_without_controller()
+            return
         self._swing_right_arm_clear()
         self._pbvs_release = bool(release)
         target = self._goal_from_telem(telem)
@@ -6206,7 +6914,7 @@ class ArmMover:
             self.message = "Direct PBVS 拒绝：按键 RGB-D 三维坐标丢失"
             return
         if callable(getattr(self.controller, "move_cartesian", None)):
-            self._direct_pbvs_via_service(self._pose_target_xyz() or target)
+            self._direct_pbvs_via_service(self._sequence_press_goal(telem, target))
             return
         commanded = self.controller.commanded_arm_rad("right")
         measured = self.controller.measured_arm_rad("right")
@@ -6225,7 +6933,7 @@ class ArmMover:
             self.phase = "direct_pbvs_rejected"
             self.message = f"Direct PBVS 拒绝：FK 指尖失败 {exc}"
             return
-        goal = self._pose_target_xyz() or target
+        goal = self._sequence_press_goal(telem, target)
         self._action_goal = tuple(float(value) for value in goal)
         solve_pose = getattr(self.ik, "apply_loaded_tool_pose_target", None)
         if not commanded or not callable(solve_pose):
@@ -6263,7 +6971,10 @@ class ArmMover:
                         ),
                     )
                     return
-                if float(current_tip[0]) > float(goal[0]) + 1e-3:
+                if (
+                    not DIRECT_PBVS_ALLOW_PAST_X
+                    and float(current_tip[0]) > float(goal[0]) + 1e-3
+                ):
                     wall = (float(goal[0]) - float(current_tip[0]), error[1], error[2])
                     if self._retract_if_deeper_than_button(wall, "DIRECT_PBVS", past_m=0.0):
                         measured = self.controller.measured_arm_rad("right")
@@ -6284,6 +6995,33 @@ class ArmMover:
                         ),
                     )
                     return
+                descent = pbvs_descent_step(error, height_m=DIRECT_PBVS_ARRIVE_TOL_M)
+                if descent is not None and self._can_axis_step():
+                    self._apply_torso_delta(
+                        descent,
+                        seconds=PBVS_STEP_SECONDS,
+                        phase="DIRECT_PBVS",
+                        limit_m=abs(descent[2]),
+                    )
+                    if str(self.message).startswith(("IK 拒绝", "IBVS 服务失败")):
+                        if self._sequence_run:
+                            self._finish_direct_pbvs(False, self.message)
+                            return
+                    else:
+                        self.message = (
+                            f"末端高于目标 {abs(float(error[2]))*1000:.0f}mm，"
+                            f"下降 {abs(descent[2])*1000:.0f}mm"
+                        )
+                        measured = self.controller.measured_arm_rad("right")
+                        commanded = self.controller.commanded_arm_rad("right") or measured
+                        q = commanded or measured
+                        if not q or not measured:
+                            break
+                        try:
+                            current_tip = self._tool_xyz(measured)
+                        except Exception:
+                            break
+                        continue
                 self.message = (
                     f"Direct PBVS 第 {_round + 1} 轮 {shot + 1} 段，去按键，还差 "
                     f"X {error[0]*1000:.0f} Y {error[1]*1000:.0f} Z {error[2]*1000:.0f} mm"
@@ -6387,10 +7125,16 @@ class ArmMover:
                 if self._stop.is_set() or getattr(self.controller, "_aborted", False):
                     self._finish_direct_pbvs(False, "Direct PBVS 已释放，停在当前位置")
                     return
-                if shot_q and (
-                    moved_distance > shot_distance + 0.03
-                    or float(current_tip[0]) > float(goal[0]) + 1e-3
-                ):
+                past_x = float(current_tip[0]) > float(goal[0]) + 1e-3
+                diverged = moved_distance > shot_distance + 0.03
+                if DIRECT_PBVS_ALLOW_PAST_X and past_x:
+                    self.log(
+                        "[ARM] Direct PBVS 临时允许末端 X 超过目标 "
+                        f"{(float(current_tip[0]) - float(goal[0])) * 1000:.0f}mm"
+                    )
+                    past_x = False
+                    diverged = False
+                if shot_q and (diverged or past_x):
                     self._restore_right_joints(shot_q)
                     try:
                         measured = self.controller.measured_arm_rad("right")
@@ -6467,6 +7211,7 @@ class ArmMover:
         tight = math.radians(1.5)
         deadline = time.monotonic() + 2.0
         while error > tight and time.monotonic() < deadline:
+            self._raise_if_sequence_next()
             if self._return_ready.is_set() or self._stop.is_set():
                 break
             final = dict(hold_fn())
@@ -6482,6 +7227,9 @@ class ArmMover:
         error = self._tracked_joint_error_rad(target_rad)
         limit = math.radians(MOTION_TRACK_TOL_DEG)
         while error > limit and time.monotonic() < deadline:
+            self._raise_if_sequence_next()
+            if self._return_ready.is_set() or self._stop.is_set():
+                break
             time.sleep(0.05)
             error = self._tracked_joint_error_rad(target_rad)
         return error
@@ -6527,6 +7275,7 @@ class ArmMover:
         previous = None
         count = len(samples)
         for index, sample in enumerate(samples):
+            self._raise_if_sequence_next()
             if self._return_ready.is_set() or self._stop.is_set():
                 break
             controller = self.controller
@@ -6592,6 +7341,10 @@ class ArmMover:
     def _play_cartesian_samples(self, samples: Sequence[Sequence[float]]) -> float:
         """Stream one Cartesian IK sequence. Tests without write() receive only the final pose."""
         self._use_motion_gains()
+        if self._motion_capture is not None:
+            self._motion_capture.extend(
+                [float(value) for value in sample] for sample in samples
+            )
         if not samples:
             return 0.0
         seconds = max(MOTION_MIN_SECONDS, (len(samples) - 1) * MOTION_DT_S)

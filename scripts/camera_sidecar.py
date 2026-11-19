@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -42,17 +43,40 @@ def _request_stop(signum, _frame) -> None:
 
 
 def _open_profiles(fps: int, want_depth: bool) -> list[tuple[int, bool]]:
-    """Keep depth on. Distance is read from the aligned depth frame.
+    """Keep depth on. Two RealSense cameras share one hub on this Orin.
 
-    640x480@15 with depth can miss the first frameset on the second camera.
-    Retry at 6 fps with depth. Do not drop the depth stream.
+    640x480@15 with depth lets the first camera take the SuperSpeed link.
+    The other falls back to USB2, keeps color, and loses depth. Open at 6 fps
+    so both color and depth fit together. Do not drop the depth stream.
     """
     ordered: list[tuple[int, bool]] = []
-    for item in ((int(fps), bool(want_depth)), (6, bool(want_depth))):
+    for item in ((6, bool(want_depth)), (int(fps), bool(want_depth))):
         if item[0] <= 0 or item in ordered:
             continue
         ordered.append(item)
     return ordered
+
+
+def _keep_usb_awake() -> None:
+    """Stop the kernel from suspending one RealSense while the other is streaming."""
+    root = Path("/sys/bus/usb/devices")
+    if not root.is_dir():
+        return
+    for dev in root.iterdir():
+        vendor = dev / "idVendor"
+        try:
+            if not vendor.is_file() or vendor.read_text(encoding="utf-8").strip() != "8086":
+                continue
+            for rel, text in (
+                ("power/control", "on"),
+                ("power/autosuspend", "-1"),
+                ("power/autosuspend_delay_ms", "-1"),
+            ):
+                path = dev / rel
+                if path.is_file():
+                    path.write_text(text, encoding="utf-8")
+        except OSError:
+            continue
 
 
 def _start(rs, serial: str, width: int, height: int, fps: int, enable_depth: bool = False):
@@ -131,6 +155,9 @@ def _write_frame(bgr: np.ndarray, out: Path) -> Path:
 
 
 _RS_IO = threading.Lock()
+_USB_KICK = threading.Lock()
+# A live camera must deliver color and depth. Longer than this, reopen that pipeline.
+STREAM_STALL_S = 3.0
 
 
 def _grab_frames(pipe):
@@ -150,6 +177,61 @@ def _grab_frames(pipe):
         return pipe.wait_for_frames(timeout_ms=200)
 
 
+def _stream_gap(now: float, last: float) -> float:
+    return now - last
+
+
+def _kick_usb(name: str) -> None:
+    """Same port power cycle that brings the cameras back. Does not touch Wi-Fi or eth2."""
+    script = Path(__file__).resolve().with_name("kick_realsense_usb.sh")
+    if not script.is_file():
+        print(f"[ibvs-cam] {name} usb kick missing {script}", flush=True)
+        return
+    if not _USB_KICK.acquire(blocking=False):
+        print(f"[ibvs-cam] {name} waiting for usb kick", flush=True)
+        with _USB_KICK:
+            return
+    print(f"[ibvs-cam] {name} usb port power cycle", flush=True)
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", str(script)],
+            timeout=20,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        text = (proc.stdout or "") + (proc.stderr or "")
+        if text.strip():
+            print(text.rstrip(), flush=True)
+        if proc.returncode != 0:
+            print(
+                f"[ibvs-cam] {name} usb kick failed ({proc.returncode}). "
+                "sudo -n must be allowed for kick_realsense_usb.sh",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[ibvs-cam] {name} usb kick failed: {exc}", flush=True)
+    finally:
+        _USB_KICK.release()
+
+
+def _stop_pipe(pipe, name: str) -> None:
+    """pipeline.stop() can sit forever on a wedged USB device. Do not block the reopen."""
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            pipe.stop()
+        except Exception as exc:
+            print(f"[ibvs-cam] {name} stop: {exc}", flush=True)
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, name=f"stop-{name}", daemon=True).start()
+    if not done.wait(2.0):
+        print(f"[ibvs-cam] {name} stop timed out; reopening", flush=True)
+
+
 def _read_frames(
     pipe,
     align,
@@ -162,44 +244,42 @@ def _read_frames(
     sensor,
     manual_exposure: bool,
 ) -> bool:
-    """Read until the stream dies. Return False when the first color frame never arrives."""
+    """Read until color or depth stops. Return False so the caller reopens the pipeline."""
     frames = 0
     empty = 0
     depth_misses = 0
     exposure_ready = False
     exposure_locked = False
     started = time.monotonic()
-    deadline = started + 8.0
     last_color = started
+    last_depth = started
     last_note = started
+    want_depth = depth_out is not None and depth_scale is not None
     while not _STOP.is_set():
         now = time.monotonic()
+        if _stream_gap(now, last_color) > STREAM_STALL_S:
+            print(
+                f"[ibvs-cam] {args.name} no color for {_stream_gap(now, last_color):.1f}s "
+                f"after {frames} frames; restart",
+                flush=True,
+            )
+            return False
+        if want_depth and frames > 0 and _stream_gap(now, last_depth) > STREAM_STALL_S:
+            print(
+                f"[ibvs-cam] {args.name} no depth for {_stream_gap(now, last_depth):.1f}s "
+                f"after {frames} frames; restart",
+                flush=True,
+            )
+            return False
         try:
             pack = _grab_frames(pipe)
         except Exception as exc:
             empty += 1
-            if frames == 0 and (empty == 1 or empty % 3 == 0):
+            if empty == 1 or empty % 15 == 0:
                 print(f"[ibvs-cam] {args.name} no frame yet: {exc}", flush=True)
-            if frames == 0 and now > deadline:
-                return False
-            if frames > 0 and now - last_color > 3.0 and now - last_note > 2.0:
-                print(
-                    f"[ibvs-cam] {args.name} stalled {now - last_color:.1f}s after {frames} frames",
-                    flush=True,
-                )
-                last_note = now
             time.sleep(0.02)
             continue
         if pack is None:
-            if frames == 0 and now > deadline:
-                print(f"[ibvs-cam] {args.name} no frame in 8s", flush=True)
-                return False
-            if frames > 0 and now - last_color > 3.0 and now - last_note > 2.0:
-                print(
-                    f"[ibvs-cam] {args.name} no new frame for {now - last_color:.1f}s after {frames}",
-                    flush=True,
-                )
-                last_note = now
             time.sleep(0.01)
             continue
         try:
@@ -208,35 +288,23 @@ def _read_frames(
                     pack = align.process(pack)
                 color = pack.get_color_frame()
                 depth_frame = None
-                if depth_out is not None and depth_scale is not None:
+                if want_depth:
                     depth_frame = pack.get_depth_frame()
                 color_data = None if color is None else np.array(color.get_data(), copy=True)
                 depth_data = None if depth_frame is None else np.array(depth_frame.get_data(), copy=True)
         except Exception as exc:
-            if frames == 0 and now > deadline:
-                print(f"[ibvs-cam] {args.name} align failed: {exc}", flush=True)
-                return False
+            print(f"[ibvs-cam] {args.name} align failed: {exc}", flush=True)
+            time.sleep(0.02)
             continue
         if color_data is None:
-            if frames == 0 and now > deadline:
-                print(f"[ibvs-cam] {args.name} color frame missing", flush=True)
-                return False
             time.sleep(0.01)
             continue
-        if depth_out is not None:
+        if want_depth:
             if depth_data is None:
                 depth_misses += 1
-                if frames == 0 and now > deadline:
-                    print(f"[ibvs-cam] {args.name} depth frame missing", flush=True)
-                    return False
-                if frames > 0 and now - last_note > 2.0:
-                    print(
-                        f"[ibvs-cam] {args.name} depth missing, color kept frames={frames}",
-                        flush=True,
-                    )
-                    last_note = now
             else:
                 write_depth(depth_out, depth_data, depth_scale)
+                last_depth = time.monotonic()
         written = _write_frame(color_data, out)
         last_color = time.monotonic()
         frames += 1
@@ -322,6 +390,7 @@ def serve_camera(rs, args) -> None:
             time.sleep(3.0)
             continue
         print(f"[ibvs-cam] {args.name} usb={line}", flush=True)
+        _keep_usb_awake()
         if args.serial and serial != args.serial:
             print(f"[ibvs-cam] {args.name} prefer {args.serial} missing; using {serial}", flush=True)
         opened = False
@@ -376,18 +445,16 @@ def serve_camera(rs, args) -> None:
                 print(f"[ibvs-cam] {args.name} stream died: {exc}", flush=True)
                 opened = False
             finally:
-                try:
-                    pipe.stop()
-                except Exception:
-                    pass
+                _stop_pipe(pipe, args.name)
             if _STOP.is_set():
                 return
             print(
                 f"[ibvs-cam] {args.name} stream ended @{fps}; reopening",
                 flush=True,
             )
-            time.sleep(0.5)
-        time.sleep(1.0)
+            _kick_usb(args.name)
+            break
+        time.sleep(0.3)
 
 
 def _run_camera(rs, cam) -> None:
@@ -442,13 +509,16 @@ def main() -> None:
         if len(args.cam) < 2:
             parser.error("--dual needs at least two --cam name:serial:out:depth")
         cameras = [_parse_cam_spec(spec) for spec in args.cam]
+        for cam in cameras:
+            cam.fps = 6
+        print("[ibvs-cam] two cameras on one hub; 640x480@6 with depth", flush=True)
         threads = [
             threading.Thread(target=_run_camera, args=(rs, cam), name=f"cam-{cam.name}")
             for cam in cameras
         ]
         for thread in threads:
             thread.start()
-            time.sleep(0.8)
+            time.sleep(2.0)
         while not _STOP.is_set():
             for index, cam in enumerate(cameras):
                 if threads[index].is_alive():

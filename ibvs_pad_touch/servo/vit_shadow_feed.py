@@ -8,7 +8,6 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from ibvs_pad_touch.platform import gpu_name, prepare_torch_gpu
 from ibvs_pad_touch.servo.vit_shadow import (
     ShadowView,
     VitShadowObserver,
@@ -38,12 +37,8 @@ class Dinov2PatchExtractor:
         mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
         batch = (tensor.to(device) - mean) / std
-        with torch.inference_mode():
-            if str(device).startswith("cuda"):
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    layers = model.get_intermediate_layers(batch, n=1, reshape=True)
-            else:
-                layers = model.get_intermediate_layers(batch, n=1, reshape=True)
+        with torch.no_grad():
+            layers = model.get_intermediate_layers(batch, n=1, reshape=True)
         grid = layers[0][0].detach().float().cpu().permute(1, 2, 0).numpy()
         return np.ascontiguousarray(grid, dtype=np.float64)
 
@@ -52,7 +47,7 @@ class Dinov2PatchExtractor:
             return self._model, self._device
         import torch
 
-        device = prepare_torch_gpu()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
             model.eval()
@@ -60,13 +55,10 @@ class Dinov2PatchExtractor:
         except Exception:
             if device == "cpu":
                 raise
-            print("[ibvs-vit] GPU 加载失败，改用 CPU", flush=True)
             device = "cpu"
             model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
             model.eval()
             model.to(device)
-        where = device if device == "cpu" else f"{device} {gpu_name()}"
-        print(f"[ibvs-vit] {self.name} on {where}", flush=True)
         self._model = model
         self._device = device
         return model, device

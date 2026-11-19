@@ -419,12 +419,13 @@ def ocr_items(image: Any) -> list[dict[str, Any]] | None:
     """Full-page RapidOCR. None means the package is not available."""
     if image is None or getattr(image, "size", 0) == 0:
         return []
-    from ibvs_pad_touch.web.screen_read import run_ocr
+    from ibvs_pad_touch.web.screen_read import _engine
 
+    engine = _engine()
+    if engine is None:
+        return None
     try:
-        outcome = run_ocr(image)
+        outcome = engine(image)
     except Exception:
         return []
-    if outcome is None:
-        return None
     return _items_from_outcome(outcome)

@@ -23,6 +23,28 @@ from ibvs_pad_touch.types import CameraPoint, Intrinsics, Localization
 ROOT = Path(__file__).resolve().parents[2]
 SEG_WEIGHTS = ROOT / "outputs" / "runs" / "yolo12_seg_20261014_1045" / "weights" / "best.pt"
 POSE_WEIGHTS = ROOT / "outputs" / "runs" / "yolo26s_pose_20261103_1130" / "weights" / "best.pt"
+
+
+def onnx_weights(path: str | Path) -> Path:
+    """Sibling ONNX next to a .pt checkpoint. best.pt -> best.onnx."""
+    return Path(path).with_suffix(".onnx")
+
+
+def rknn_weights(path: str | Path) -> Path:
+    """Sibling RKNN next to a .pt checkpoint. best.pt -> best.rknn."""
+    return Path(path).with_suffix(".rknn")
+
+
+def _model_imgsz(model, weights: Path, fallback: int) -> int:
+    """ONNX graphs are fixed-size. PyTorch checkpoints keep the caller's imgsz."""
+    if weights.suffix.lower() != ".onnx":
+        return int(fallback)
+    size = (getattr(model, "overrides", None) or {}).get("imgsz")
+    if isinstance(size, (list, tuple)):
+        size = size[0] if size else None
+    if isinstance(size, (int, float)) and int(size) > 0:
+        return int(size)
+    return int(fallback)
 KPT_NAMES = ("gripper_tip", "button_1", "button_2", "button_3", "FingerTip")
 BUTTON_NAMES = ("button_1", "button_2", "button_3")
 # Chest and wrist each run seg + pose. Two forwards at a time keep the Orin GPU busy
@@ -100,11 +122,24 @@ class YoloTouchDetector:
         imgsz: int = 640,
         name: str = "",
         cpu_pose: bool = False,
+        use_onnx: bool = False,
+        use_rknn: bool = False,
     ) -> None:
         self.name = str(name or "")
-        self.seg_weights = Path(seg_weights)
-        self.pose_weights = Path(pose_weights)
+        self.use_onnx = bool(use_onnx) and not bool(use_rknn)
+        self.use_rknn = bool(use_rknn)
+        if self.use_rknn:
+            self.seg_weights = rknn_weights(seg_weights)
+            self.pose_weights = rknn_weights(pose_weights)
+        elif self.use_onnx:
+            self.seg_weights = onnx_weights(seg_weights)
+            self.pose_weights = onnx_weights(pose_weights)
+        else:
+            self.seg_weights = Path(seg_weights)
+            self.pose_weights = Path(pose_weights)
         self.imgsz = int(imgsz)
+        self._seg_imgsz = self.imgsz
+        self._pose_imgsz = self.imgsz
         self._cpu_pose = bool(cpu_pose)
         self._infer_lock = threading.Lock()
         self._cpu_lock = threading.Lock()
@@ -112,6 +147,9 @@ class YoloTouchDetector:
         self._wrist_waiting = False
         self._seg = None
         self._pose = None
+        self._rknn_seg = None
+        self._rknn_pose = None
+        self._seg_disabled = False
         self._device = "cpu"
         self._half = False
         self._ready = False
@@ -122,6 +160,8 @@ class YoloTouchDetector:
         if self._failed:
             return self._failed
         if self._ready:
+            if self.use_rknn:
+                return "yolo rknn"
             precision = "fp16" if self._half else "fp32"
             return f"yolo {self._device} {precision}"
         pose_only = self._cpu_pose and self.pose_weights.is_file()
@@ -132,6 +172,8 @@ class YoloTouchDetector:
         return "idle"
 
     def predict(self, bgr: np.ndarray, *, pose_only: bool = False) -> YoloTouch | None:
+        if self.use_rknn:
+            return self._predict_rknn(bgr, pose_only=pose_only or self._cpu_pose)
         if self._cpu_pose:
             return self._predict_cpu_pose(bgr)
         with self._load_lock:
@@ -143,7 +185,7 @@ class YoloTouchDetector:
             # wrist fingertip only updated after both of those finished.
             self._wrist_waiting = True
             try:
-                pose = self._forward(self._pose, image, polite=False)
+                pose = self._forward(self._pose, image, polite=False, imgsz=self._pose_imgsz)
             finally:
                 self._wrist_waiting = False
             return YoloTouch(
@@ -152,14 +194,104 @@ class YoloTouchDetector:
                 points=_pose_points(pose),
                 masks=[],
             )
-        seg = self._forward(self._seg, image, polite=True)
-        pose = self._forward(self._pose, image, polite=True)
+        seg = self._forward(self._seg, image, polite=True, imgsz=self._seg_imgsz)
+        pose = self._forward(self._pose, image, polite=True, imgsz=self._pose_imgsz)
         return YoloTouch(
             panel_corners=_panel_quad(seg),
             panel_conf=_panel_conf(seg),
             points=_pose_points(pose),
             masks=_seg_masks(seg),
         )
+
+    def _predict_rknn(self, bgr: np.ndarray, *, pose_only: bool = False) -> YoloTouch | None:
+        from ibvs_pad_touch.perception.rknn_yolo import pose_points, seg_instances
+
+        with self._load_lock:
+            if not self._ensure_rknn():
+                return None
+        image = np.ascontiguousarray(bgr)
+        height, width = image.shape[:2]
+        outputs, ratio, pad_x, pad_y = self._rknn_pose.infer(image)
+        pose_only_touch = YoloTouch(
+            panel_corners=None,
+            panel_conf=0.0,
+            points=_rknn_pose_points(pose_points(outputs[0], ratio, pad_x, pad_y, self._rknn_pose.imgsz)),
+            masks=[],
+        )
+        if pose_only or self._rknn_seg is None or self._seg_disabled:
+            return pose_only_touch
+        seg_box: dict = {}
+
+        def _run_seg() -> None:
+            try:
+                seg_box["value"] = self._rknn_seg.infer(image)
+            except Exception as exc:
+                seg_box["error"] = exc
+
+        seg_thread = threading.Thread(target=_run_seg, name=f"rknn-seg-{self.name}", daemon=True)
+        seg_thread.start()
+        seg_thread.join(1.5)
+        if seg_thread.is_alive() or "error" in seg_box or "value" not in seg_box:
+            self._seg_disabled = True
+            detail = seg_box.get("error", "timeout 1.5s")
+            print(f"[ibvs-yolo] {self.name} seg skipped, pose still drawn: {detail}", flush=True)
+            return pose_only_touch
+        seg_out, seg_ratio, seg_px, seg_py = seg_box["value"]
+        pose_out, pose_ratio, pose_px, pose_py = outputs, ratio, pad_x, pad_y
+        det, proto = _seg_outputs(seg_out)
+        instances = seg_instances(det, proto, seg_px, seg_py, (height, width), self._rknn_seg.imgsz)
+        masks = [
+            YoloMask(name=name, conf=conf, polygon=polygon)
+            for name, conf, polygon in instances
+        ]
+        panel = next((item for item in instances if item[0] == "panel"), None)
+        corners = None
+        panel_conf = 0.0
+        if panel is not None and len(panel[2]) >= 4:
+            panel_conf = float(panel[1])
+            quad = order_corners(cv2.boxPoints(cv2.minAreaRect(np.asarray(panel[2], dtype=np.float32))))
+            corners = [(float(x), float(y)) for x, y in quad]
+        points = pose_points(pose_out[0], pose_ratio, pose_px, pose_py, self._rknn_pose.imgsz)
+        return YoloTouch(
+            panel_corners=corners,
+            panel_conf=panel_conf,
+            points=_rknn_pose_points(points),
+            masks=masks,
+        )
+
+    def _ensure_rknn(self) -> bool:
+        if self._ready:
+            return True
+        if self._failed:
+            return False
+        needed = [self.pose_weights] if self._cpu_pose else [self.seg_weights, self.pose_weights]
+        missing = [path for path in needed if not path.is_file()]
+        if missing:
+            self._failed = "weights missing"
+            print(f"[ibvs-yolo] weights missing {missing}", flush=True)
+            return False
+        try:
+            from ibvs_pad_touch.perception.rknn_yolo import RknnSession
+
+            pose_core = 2 if self._cpu_pose else 1
+            self._rknn_pose = RknnSession(self.pose_weights, imgsz=640, core=pose_core)
+            self._pose_imgsz = 640
+            label = f"{self.name} " if self.name else ""
+            print(f"[ibvs-yolo] {label}pose loaded npu core {pose_core} {self.pose_weights.name}", flush=True)
+            if not self._cpu_pose:
+                try:
+                    self._rknn_seg = RknnSession(self.seg_weights, imgsz=1280, core=0)
+                    self._seg_imgsz = 1280
+                    print(f"[ibvs-yolo] {label}seg loaded npu core 0 {self.seg_weights.name}", flush=True)
+                except Exception as exc:
+                    self._rknn_seg = None
+                    print(f"[ibvs-yolo] {label}seg failed, pose still runs: {exc}", flush=True)
+            self._ready = True
+            return True
+        except Exception as exc:
+            self._failed = f"rknn unavailable: {exc}"
+            print(f"[ibvs-yolo] {self._failed}", flush=True)
+            return False
 
     def _predict_cpu_pose(self, bgr: np.ndarray) -> YoloTouch | None:
         """Right-wrist pose. A second model on CPU, so the chest GPU run is not moved."""
@@ -168,7 +300,7 @@ class YoloTouchDetector:
                 return None
         image = np.ascontiguousarray(bgr)
         with self._cpu_lock:
-            pose = self._predict(self._pose, image, device="cpu", half=False)
+            pose = self._predict(self._pose, image, device="cpu", half=False, imgsz=self._pose_imgsz)
         return YoloTouch(
             panel_corners=None,
             panel_conf=0.0,
@@ -178,11 +310,11 @@ class YoloTouchDetector:
 
     def _forward_pair(self, image: np.ndarray):
         """One GPU. Two Ultralytics predicts at once queue behind each other and run slower than one after the other."""
-        seg = self._forward(self._seg, image, polite=False)
-        pose = self._forward(self._pose, image, polite=False)
+        seg = self._forward(self._seg, image, polite=False, imgsz=self._seg_imgsz)
+        pose = self._forward(self._pose, image, polite=False, imgsz=self._pose_imgsz)
         return seg, pose
 
-    def _forward(self, model, image: np.ndarray, *, polite: bool = False):
+    def _forward(self, model, image: np.ndarray, *, polite: bool = False, imgsz: int | None = None):
         deadline = time.monotonic() + 0.4
         while True:
             if polite and self._wrist_waiting and time.monotonic() < deadline:
@@ -192,13 +324,21 @@ class YoloTouchDetector:
                 if polite and self._wrist_waiting and time.monotonic() < deadline:
                     continue
                 with _GPU_SLOTS:
-                    return self._predict(model, image)
+                    return self._predict(model, image, imgsz=imgsz)
 
-    def _predict(self, model, image: np.ndarray, *, device: str | None = None, half: bool | None = None):
+    def _predict(
+        self,
+        model,
+        image: np.ndarray,
+        *,
+        device: str | None = None,
+        half: bool | None = None,
+        imgsz: int | None = None,
+    ):
         use_device = self._device if device is None else device
         use_half = self._half if half is None else half
         kwargs = {
-            "imgsz": self.imgsz,
+            "imgsz": self.imgsz if imgsz is None else int(imgsz),
             "conf": 0.15,
             "device": use_device,
             "verbose": False,
@@ -247,12 +387,14 @@ class YoloTouchDetector:
             self._device = "cpu"
             self._half = False
             self._pose = YOLO(str(self.pose_weights))
-            blank = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
-            self._predict(self._pose, blank, device="cpu", half=False)
+            self._pose_imgsz = _model_imgsz(self._pose, self.pose_weights, self.imgsz)
+            blank = np.zeros((self._pose_imgsz, self._pose_imgsz, 3), dtype=np.uint8)
+            self._predict(self._pose, blank, device="cpu", half=False, imgsz=self._pose_imgsz)
             self._ready = True
             label = f"{self.name} " if self.name else ""
+            kind = "onnx " if self.use_onnx else ""
             print(
-                f"[ibvs-yolo] {label}loaded cpu fp32 {self.pose_weights.name}",
+                f"[ibvs-yolo] {label}loaded cpu fp32 {kind}{self.pose_weights.name}",
                 flush=True,
             )
             return True
@@ -266,6 +408,8 @@ class YoloTouchDetector:
             return True
         if self._failed:
             return False
+        if self.use_rknn:
+            return self._ensure_rknn()
         if self._cpu_pose:
             return self._ensure_cpu_pose()
         if not self.seg_weights.is_file() or not self.pose_weights.is_file():
@@ -280,10 +424,13 @@ class YoloTouchDetector:
 
             _silence_half_deprecation()
             self._device = prepare_torch_gpu()
-            self._half = self._device.startswith("cuda")
+            self._half = self._device.startswith("cuda") and not self.use_onnx
             self._seg = YOLO(str(self.seg_weights))
             self._pose = YOLO(str(self.pose_weights))
-            blank = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            self._seg_imgsz = _model_imgsz(self._seg, self.seg_weights, self.imgsz)
+            self._pose_imgsz = _model_imgsz(self._pose, self.pose_weights, self.imgsz)
+            blank_side = max(self._seg_imgsz, self._pose_imgsz)
+            blank = np.zeros((blank_side, blank_side, 3), dtype=np.uint8)
             try:
                 self._forward_pair(blank)
             except Exception as exc:
@@ -297,8 +444,9 @@ class YoloTouchDetector:
             label = f"{self.name} " if self.name else ""
             where = self._device if self._device == "cpu" else f"{self._device} {gpu_name()}"
             precision = "fp16" if self._half else "fp32"
+            kind = "onnx " if self.use_onnx else ""
             print(
-                f"[ibvs-yolo] {label}loaded {where} {precision} "
+                f"[ibvs-yolo] {label}loaded {where} {precision} {kind}"
                 f"{self.seg_weights.name} + {self.pose_weights.name}",
                 flush=True,
             )
@@ -488,6 +636,19 @@ def _pose_keypoint(
     if pt is None or float(pt.conf) < float(conf_min):
         return None
     return CameraPoint(u=pt.u, v=pt.v, source=source, confidence=float(pt.conf))
+
+
+def _rknn_pose_points(points: dict[str, tuple[float, float, float]]) -> dict[str, YoloPoint]:
+    return {
+        name: YoloPoint(name=name, u=u, v=v, conf=conf)
+        for name, (u, v, conf) in points.items()
+    }
+
+
+def _seg_outputs(outputs: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    det = next(item for item in outputs if item.shape[-1] == 38)
+    proto = next(item for item in outputs if item.shape[-1] != 38)
+    return det, proto
 
 
 def _class_name(result, index: int) -> str:

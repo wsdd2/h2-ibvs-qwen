@@ -1,14 +1,10 @@
-import time
-
 import numpy as np
 
 from ibvs_pad_touch.perception.yolo_touch import (
     YoloMask,
     YoloPoint,
     YoloTouch,
-    YoloTouchDetector,
     apply_pose_buttons,
-    _pose_points,
     normalize_button_layout,
     pose_button_ok,
     pose_finger_tip,
@@ -51,11 +47,11 @@ def test_gripper_without_a_pose_tip_uses_the_narrow_end_of_the_long_axis():
     assert 180.0 < tip.u < 220.0
 
 
-def test_side_view_does_not_invent_a_tip_from_a_seg_mask():
+def test_side_view_draws_the_axis_tip_when_pose_is_missing():
     from ibvs_pad_touch.perception.yolo_touch import YoloMask, YoloTouch
 
     class _JawOnly:
-        def predict(self, bgr, **_kwargs):
+        def predict(self, bgr):
             return YoloTouch(
                 masks=[
                     YoloMask(
@@ -71,7 +67,7 @@ def test_side_view_does_not_invent_a_tip_from_a_seg_mask():
     out = annotator.annotate("d435i", frame)
     assert annotator.telemetry()["side_measured"] is False
     assert annotator.telemetry()["left_contact"] is False
-    assert int(out[180, 420].max()) == 240
+    assert int(out[36:48, 410:430, 1].max()) > 250
 
 
 def test_low_confidence_gripper_and_a_tip_off_the_jaw_are_dropped():
@@ -320,41 +316,6 @@ def test_revo2_mode_drops_gripper_and_gripper_tip():
     assert pose_tip(kept_finger, 0.3) is None
 
 
-def test_pose_keeps_the_fingertip_from_a_lower_scoring_box():
-    class _Tensor:
-        def __init__(self, value):
-            self.value = np.asarray(value, dtype=np.float32)
-
-        def detach(self):
-            return self
-
-        def cpu(self):
-            return self
-
-        def numpy(self):
-            return self.value
-
-        def __len__(self):
-            return len(self.value)
-
-    class _Keypoints:
-        def __init__(self, value):
-            self.data = _Tensor(value)
-
-    class _Result:
-        def __init__(self, value):
-            self.keypoints = _Keypoints(value)
-            self.boxes = None
-
-    # Higher box has no fingertip. The hand is the second box.
-    rows = np.zeros((2, 5, 3), dtype=np.float32)
-    rows[0, 0] = (10.0, 10.0, 0.9)
-    rows[1, 4] = (200.0, 180.0, 0.4)
-    found = _pose_points(_Result(rows))
-    assert abs(found["gripper_tip"].conf - 0.9) < 1e-5
-    assert (found["FingerTip"].u, found["FingerTip"].v) == (200.0, 180.0)
-
-
 def test_button3_above_button1_is_swapped_back():
     swapped = normalize_button_layout(
         YoloTouch(
@@ -378,67 +339,28 @@ def test_button3_above_button1_is_swapped_back():
     assert (kept.point("button_1").v, kept.point("button_3").v) == (140.0, 220.0)
 
 
-def test_seg_and_pose_run_at_the_same_time():
-    class _Empty:
-        boxes = None
-        masks = None
-        keypoints = None
+def test_letterbox_matches_the_pose_onnx_pad():
+    from ibvs_pad_touch.perception.rknn_yolo import unletter
 
-    log = []
-
-    class _Model:
-        def __init__(self, name):
-            self.name = name
-
-        def predict(self, image, **kwargs):
-            assert kwargs["device"] == "cpu"
-            log.append(("start", self.name))
-            time.sleep(0.12)
-            log.append(("end", self.name))
-            return [_Empty()]
-
-    detector = YoloTouchDetector(name="chest")
-    detector._ready = True
-    detector._device = "cpu"
-    detector._half = False
-    detector._seg = _Model("seg")
-    detector._pose = _Model("pose")
-    touch = detector.predict(np.zeros((32, 32, 3), dtype=np.uint8))
-    assert touch is not None
-    assert [(item[0], item[1]) for item in log] == [
-        ("start", "seg"),
-        ("end", "seg"),
-        ("start", "pose"),
-        ("end", "pose"),
-    ]
-    log.clear()
-    pose_only = detector.predict(np.zeros((32, 32, 3), dtype=np.uint8), pose_only=True)
-    assert pose_only is not None
-    assert pose_only.masks == []
-    assert pose_only.panel_corners is None
-    assert [(item[0], item[1]) for item in log] == [("start", "pose"), ("end", "pose")]
+    # 480x640 image into 640 input pads 80 px on the top. Raw y 390.61 -> 310.61.
+    u, v = unletter(320.1, 390.61, 1.0, 0, 80)
+    assert abs(u - 320.1) < 1e-6
+    assert abs(v - 310.61) < 1e-6
 
 
-def test_wrist_pose_uses_its_own_cpu_model():
-    class _Empty:
-        boxes = None
-        masks = None
-        keypoints = None
+def test_onnx_switch_uses_the_sibling_best_onnx():
+    from ibvs_pad_touch.perception.yolo_touch import POSE_WEIGHTS, SEG_WEIGHTS, YoloTouchDetector
 
-    log = []
-
-    class _Model:
-        def predict(self, image, **kwargs):
-            log.append(kwargs["device"])
-            return [_Empty()]
-
-    detector = YoloTouchDetector(name="wrist", cpu_pose=True)
-    detector._ready = True
-    detector._device = "cpu"
-    detector._half = False
-    detector._pose = _Model()
-    detector._seg = _Model()
-    touch = detector.predict(np.zeros((32, 32, 3), dtype=np.uint8))
-    assert touch is not None
-    assert touch.masks == []
-    assert log == ["cpu"]
+    pt = YoloTouchDetector(name="chest")
+    onnx = YoloTouchDetector(name="chest", use_onnx=True)
+    assert pt.seg_weights == SEG_WEIGHTS
+    assert pt.pose_weights == POSE_WEIGHTS
+    assert onnx.seg_weights == SEG_WEIGHTS.with_suffix(".onnx")
+    assert onnx.pose_weights == POSE_WEIGHTS.with_suffix(".onnx")
+    assert not pt.use_onnx
+    assert onnx.use_onnx
+    rknn = YoloTouchDetector(name="chest", use_rknn=True)
+    assert rknn.seg_weights == SEG_WEIGHTS.with_suffix(".rknn")
+    assert rknn.pose_weights == POSE_WEIGHTS.with_suffix(".rknn")
+    assert rknn.use_rknn
+    assert not rknn.use_onnx

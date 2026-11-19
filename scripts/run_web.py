@@ -123,6 +123,16 @@ def main() -> None:
         default="",
         help="右手串口在机器人 PC2 上时填写，例如 192.168.123.162:8091。Orin 只发送目标姿势。",
     )
+    parser.add_argument(
+        "--onnx",
+        action="store_true",
+        help="分割和姿态改用同目录的 best.onnx。不加则仍加载原来的 best.pt。",
+    )
+    parser.add_argument(
+        "--rknn",
+        action="store_true",
+        help="分割和姿态改用同目录的 best.rknn，在 RK3588 NPU 上计算。",
+    )
     args = parser.parse_args()
     dash = RealRobotDashboard(
         host=args.host,
@@ -151,6 +161,8 @@ def main() -> None:
         right_ee=args.right_ee,
         records_port=args.records_port,
         revo2_bridge=args.revo2_bridge,
+        use_onnx=args.onnx,
+        use_rknn=args.rknn,
     )
 
     interrupting = False

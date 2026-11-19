@@ -17,3 +17,6 @@ outputs/
 **/results.csv
 **/weights/last.pt
 **/weights/epoch*.pt
+*.onnx
+*.rknn
+ibvs_pad_touch/ibvs_pad_touch/
